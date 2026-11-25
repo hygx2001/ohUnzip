@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#3B82F6"/>
+      <stop offset="55%" stop-color="#2563EB"/>
+      <stop offset="100%" stop-color="#1D4ED8"/>
+    </linearGradient>
+    <linearGradient id="pull" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FDE047"/>
+      <stop offset="100%" stop-color="#F59E0B"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded square app background -->
+  <rect x="12" y="12" width="232" height="232" rx="54" fill="url(#bg)"/>
+  <rect x="14" y="14" width="228" height="228" rx="52" fill="none" stroke="#FFFFFF" stroke-opacity="0.16" stroke-width="3"/>
+
+  <!-- Bold "O" ring with a clean unzipped gap at the top -->
+  <path
+    d="M 162 66 A 72 72 0 1 1 94 66"
+    fill="none"
+    stroke="#FFFFFF"
+    stroke-width="28"
+    stroke-linecap="round"
+  />
+
+  <!-- Alternating zipper teeth neatly inside the top gap -->
+  <rect x="112" y="42" width="15" height="9" rx="4" fill="#DBEAFE"/>
+  <rect x="129" y="56" width="15" height="9" rx="4" fill="#DBEAFE"/>
+  <rect x="112" y="70" width="15" height="9" rx="4" fill="#DBEAFE"/>
+  <rect x="129" y="84" width="15" height="9" rx="4" fill="#DBEAFE"/>
+
+  <!-- Zipper slider head -->
+  <rect x="112" y="96" width="32" height="24" rx="8" fill="url(#pull)"/>
+  <rect x="121" y="104" width="14" height="6" rx="3" fill="#1D4ED8"/>
+
+  <!-- Hinged zipper pull tab inside the center of the O -->
+  <rect x="116" y="122" width="24" height="44" rx="11" fill="url(#pull)"/>
+  <rect x="123" y="144" width="10" height="14" rx="5" fill="#1D4ED8"/>
+</svg>
