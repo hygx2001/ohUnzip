@@ -292,8 +292,9 @@ impl ExtractionContext {
                     stego.restored_log(detected.format)
                 ));
                 let path = restored.0.clone();
+                let ftype = resolve_seven_zip_type(&path, detected.format);
                 _carved_guard = Some(restored);
-                (path, detected.format.seven_zip_type())
+                (path, ftype)
             }
         } else if let Some(ref split_info) = detected.disguised_split {
             let (guard, first_clean, total_count, unwrapped_count) =
@@ -345,7 +346,7 @@ impl ExtractionContext {
         } else {
             let ftype = match detected.trick {
                 TrickKind::DisguisedExtension { .. } if !detected.is_split => {
-                    detected.format.seven_zip_type()
+                    resolve_seven_zip_type(archive_path, detected.format)
                 }
                 _ => None,
             };
@@ -574,7 +575,26 @@ impl ExtractionContext {
             return Err(ExtractError::Cancelled);
         }
 
-        let (probe, comment_hints) = self.probe_archive_encryption(actual_archive, force_type);
+        let mut force_type = force_type;
+        let (mut probe, mut comment_hints) =
+            self.probe_archive_encryption(actual_archive, force_type);
+        // Defense in depth: if an explicit `-t<type>` failed to open the archive (e.g. type mismatch),
+        // retry letting 7-Zip auto-detect from magic bytes before giving up.
+        if force_type.is_some()
+            && matches!(probe, EncryptionProbe::Fatal(_) | EncryptionProbe::Unknown)
+        {
+            let (retry_probe, retry_hints) = self.probe_archive_encryption(actual_archive, None);
+            if !matches!(
+                retry_probe,
+                EncryptionProbe::Fatal(_) | EncryptionProbe::Unknown
+            ) {
+                force_type = None;
+                probe = retry_probe;
+                if !retry_hints.is_empty() {
+                    comment_hints = retry_hints;
+                }
+            }
+        }
 
         // Merge any password hints discovered inside the archive's Comment field right near the front!
         let mut candidates: Vec<String> = Vec::with_capacity(base_candidates.len() + comment_hints.len());
@@ -958,10 +978,17 @@ impl ExtractionContext {
         );
 
         if any_encrypted {
+            // Only pre-test the smallest entry via `7z t` if it's <= 32 MB.
+            // For huge single-entry archives (e.g. a 2.7 GB nested .zip inside RAR5),
+            // running `7z t` before `7z x` would decompress the entire multi-GB entry twice
+            // without a progress bar; going straight to `7z x` rejects wrong passwords in ~50ms
+            // and extracts right passwords in one pass with live progress & cancellation.
+            const MAX_PRETEST_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
+            let smallest_entry = smallest.and_then(|(sz, p)| {
+                (sz <= MAX_PRETEST_ENTRY_BYTES).then_some(p)
+            });
             (
-                EncryptionProbe::DataEncrypted {
-                    smallest_entry: smallest.map(|(_, p)| p),
-                },
+                EncryptionProbe::DataEncrypted { smallest_entry },
                 comment_hints,
             )
         } else {
@@ -1344,7 +1371,7 @@ impl ExtractionContext {
             .map_err(|e| ExtractError::Fatal(format!("无法创建外层解包临时目录: {e}")))?;
         let _dir_guard = TempDirGuard(tmp_dir.clone());
 
-        match self.run_7z_extract(src, outer_fmt.seven_zip_type(), &tmp_dir, "") {
+        match self.run_7z_extract(src, resolve_seven_zip_type(src, outer_fmt), &tmp_dir, "") {
             Ok(()) => {}
             Err(SevenZRunError::Cancelled) => return Err(ExtractError::Cancelled),
             Err(SevenZRunError::WrongPassword) => {
@@ -1518,6 +1545,27 @@ fn map_lz4_error(err: Lz4Error) -> ExtractError {
         Lz4Error::Cancelled => ExtractError::Cancelled,
         Lz4Error::Message(msg) => ExtractError::Fatal(msg),
     }
+}
+
+/// Resolves the exact 7-Zip `-t<type>` switch for `path`.
+/// Crucially, 7-Zip uses `-trar` ONLY for RAR4 (`Rar!\x1A\x07\x00`) and `-trar5` for RAR5
+/// (`Rar!\x1A\x07\x01\x00`); passing `-trar` on a RAR5 archive fails with "Is not archive".
+fn resolve_seven_zip_type(path: &Path, fmt: ArchiveFormat) -> Option<&'static str> {
+    if fmt == ArchiveFormat::Rar {
+        let mut buf = [0u8; 8];
+        if let Ok(mut f) = File::open(path) {
+            if let Ok(n) = f.read(&mut buf) {
+                if n >= 8 && &buf[0..8] == b"Rar!\x1A\x07\x01\x00" {
+                    return Some("rar5");
+                }
+                if n >= 7 && &buf[0..7] == b"Rar!\x1A\x07\x00" {
+                    return Some("rar");
+                }
+            }
+        }
+        return None;
+    }
+    fmt.seven_zip_type()
 }
 
 enum EncryptionProbe {
@@ -2154,6 +2202,23 @@ mod tests {
         assert_eq!(parse_latest_progress_percent(" 12% 3 - file.bin\r 47%"), Some(47));
         assert_eq!(parse_latest_progress_percent("100% Everything is Ok"), Some(100));
         assert_eq!(parse_latest_progress_percent("Scanning..."), None);
+    }
+
+    #[test]
+    fn test_resolve_seven_zip_type_distinguishes_rar5_and_rar4() {
+        let dir = std::env::temp_dir().join("oh_unzip_rar5_type_tests");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let rar5 = dir.join("disguised_rar5.jpg");
+        fs::write(&rar5, b"Rar!\x1A\x07\x01\x00extra-bytes").unwrap();
+        assert_eq!(resolve_seven_zip_type(&rar5, ArchiveFormat::Rar), Some("rar5"));
+
+        let rar4 = dir.join("disguised_rar4.jpg");
+        fs::write(&rar4, b"Rar!\x1A\x07\x00extra-bytes").unwrap();
+        assert_eq!(resolve_seven_zip_type(&rar4, ArchiveFormat::Rar), Some("rar"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn apate_disguise_bytes(orig: &[u8], mask: &[u8]) -> Vec<u8> {
