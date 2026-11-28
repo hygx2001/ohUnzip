@@ -4,10 +4,11 @@ use crate::detector::{
     extract_password_hints_from_filename,
 };
 use crate::seven_zip::new_hidden_command;
+use crate::stego::{StegoError, StegoRestorer};
 use crate::trash;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -150,7 +151,7 @@ pub fn run_extraction_job(
 
     match ctx.extract_recursive(&source_path, &detected, &final_output_dir, 0) {
         Ok(()) => {
-            if ctx.config.move_source_to_trash && detected.offset == 0 {
+            if ctx.config.move_source_to_trash && !detected.is_stego_carrier() {
                 let to_trash = collect_source_files_to_trash(&source_path, &detected);
                 let mut trashed = 0usize;
                 for p in &to_trash {
@@ -191,6 +192,7 @@ pub fn run_extraction_job(
     }
 }
 
+#[derive(Debug)]
 enum ExtractError {
     Cancelled,
     NeedPassword {
@@ -247,27 +249,51 @@ impl ExtractionContext {
         }
 
         // Prepare source file for 7z:
-        // - Polyglot (offset > 0): carve payload to temp file
+        // - Stego/polyglot carrier (single file or split volumes): stream-restore via `StegoRestorer`
         // - Disguised split volumes (e.g. `movie.7z.001.mp4` + `.002.mp4`): hard-link clean names into temp dir
         let mut _carved_guard: Option<TempFileGuard> = None;
         let mut _split_guard: Option<TempDirGuard> = None;
 
-        let (actual_archive, force_type) = if detected.offset > 0 {
-            self.stage(format!(
-                "正在提取隐写载荷 ({} @ {})...",
-                detected.format.display_name(),
-                detector::format_bytes(detected.offset)
-            ));
-            let carved = carve_payload_to_temp(archive_path, detected.offset, detected.format)
-                .map_err(ExtractError::Fatal)?;
-            self.log(format!(
-                "[第{}层] 已剥离隐写尾部载荷 → 临时文件 ({})",
-                depth + 1,
-                detected.format.canonical_ext()
-            ));
-            let path = carved.0.clone();
-            _carved_guard = Some(carved);
-            (path, detected.format.seven_zip_type())
+        let (actual_archive, force_type) = if let Some(ref stego) = detected.stego {
+            if detected.is_split {
+                let (guard, first_clean, restored_count, total_count) = self
+                    .stage_stego_split_volumes(
+                        archive_path,
+                        detected,
+                        stego.as_ref(),
+                        target_dir,
+                        depth,
+                    )?;
+                self.log(format!(
+                    "[第{}层] 已还原 {}/{} 个隐写分卷 ({}) → {}",
+                    depth + 1,
+                    restored_count,
+                    total_count,
+                    stego.tool_id(),
+                    first_clean
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                ));
+                _split_guard = Some(guard);
+                (first_clean, None)
+            } else {
+                let restored = self.restore_stego_to_temp(
+                    archive_path,
+                    stego.as_ref(),
+                    detected.format,
+                    target_dir,
+                    depth,
+                )?;
+                self.log(format!(
+                    "[第{}层] {}",
+                    depth + 1,
+                    stego.restored_log(detected.format)
+                ));
+                let path = restored.0.clone();
+                _carved_guard = Some(restored);
+                (path, detected.format.seven_zip_type())
+            }
         } else if let Some(ref split_info) = detected.disguised_split {
             let (guard, first_clean, linked_count) =
                 stage_disguised_split_volumes(archive_path, split_info)
@@ -435,7 +461,7 @@ impl ExtractionContext {
 
             self.extract_recursive(&file_path, &nested_det, &nested_target, next_depth)?;
 
-            if self.config.clean_intermediate && nested_det.offset == 0 {
+            if self.config.clean_intermediate && !nested_det.is_stego_carrier() {
                 if nested_det.is_split {
                     for p in collect_source_files_to_trash(&file_path, &nested_det) {
                         let _ = fs::remove_file(p);
@@ -717,10 +743,10 @@ impl ExtractionContext {
         if is_wrong_password_output(&combined) {
             return Some(DetectedArchive {
                 format: ArchiveFormat::Generic,
-                offset: 0,
                 trick: TrickKind::DisguisedExtension { original_ext: ext },
                 is_split: false,
                 disguised_split: None,
+                stego: None,
             });
         }
         if !out.status.success() {
@@ -741,10 +767,10 @@ impl ExtractionContext {
                     };
                     return Some(DetectedArchive {
                         format: fmt,
-                        offset: 0,
                         trick,
                         is_split: false,
                         disguised_split: None,
+                        stego: None,
                     });
                 }
             }
@@ -1025,6 +1051,140 @@ impl ExtractionContext {
 
         Err(SevenZRunError::Other(err_line.to_string()))
     }
+
+    /// Restores a single stego/polyglot file to a temporary file without modifying the original.
+    fn restore_stego_to_temp(
+        &self,
+        src: &Path,
+        restorer: &dyn StegoRestorer,
+        fmt: ArchiveFormat,
+        target_dir: &Path,
+        depth: usize,
+    ) -> Result<TempFileGuard, ExtractError> {
+        let base_label = restorer.stage_label(fmt);
+        self.stage(format!("[第{}层] {base_label}...", depth + 1));
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let temp_name = format!(
+            ".ohunzip_stego_{}_{}_{}.{}",
+            restorer.tool_id(),
+            std::process::id(),
+            ts,
+            fmt.canonical_ext()
+        );
+
+        // Prefer placing the restored temp file on the same drive as `target_dir` so multi-GB
+        // stego files don't exhaust a small C: temp partition; fall back to system temp dir.
+        let temp_path = target_dir
+            .parent()
+            .filter(|p| fs::create_dir_all(p).is_ok())
+            .map(|p| p.join(&temp_name))
+            .and_then(|candidate| File::create(&candidate).ok().map(|_| candidate))
+            .unwrap_or_else(|| std::env::temp_dir().join(&temp_name));
+
+        let guard = TempFileGuard(temp_path.clone());
+        let mut last_pct = 0u8;
+        restorer
+            .restore_to(src, &temp_path, &self.cancel_flag, &mut |pct| {
+                if pct >= last_pct.saturating_add(2) || pct == 100 {
+                    last_pct = pct;
+                    let _ = self.tx.send(ExtractEvent::Stage(format!(
+                        "[第{}层] {base_label} ({pct}%)...",
+                        depth + 1
+                    )));
+                }
+            })
+            .map_err(map_stego_error)?;
+        Ok(guard)
+    }
+
+    /// Restores all sibling volumes of a stego-disguised split archive into a temporary directory.
+    fn stage_stego_split_volumes(
+        &self,
+        first_vol: &Path,
+        detected: &DetectedArchive,
+        first_restorer: &dyn StegoRestorer,
+        target_dir: &Path,
+        depth: usize,
+    ) -> Result<(TempDirGuard, PathBuf, usize, usize), ExtractError> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir_name = format!(
+            ".ohunzip_stego_split_{}_{}_{}",
+            first_restorer.tool_id(),
+            std::process::id(),
+            ts
+        );
+        let stage_dir = target_dir
+            .parent()
+            .or_else(|| first_vol.parent())
+            .filter(|p| fs::create_dir_all(p).is_ok())
+            .map(|p| p.join(&dir_name))
+            .unwrap_or_else(|| std::env::temp_dir().join(&dir_name));
+
+        fs::create_dir_all(&stage_dir)
+            .map_err(|e| ExtractError::Fatal(format!("无法创建隐写分卷临时目录: {e}")))?;
+        let guard = TempDirGuard(stage_dir.clone());
+
+        let siblings = find_split_siblings_with_clean_names(first_vol, detected);
+        let total = siblings.len();
+        let mut restored_count = 0usize;
+        let mut first_clean_path: Option<PathBuf> = None;
+
+        for (idx, (src_path, clean_name)) in siblings.into_iter().enumerate() {
+            if self.is_cancelled() {
+                return Err(ExtractError::Cancelled);
+            }
+            let dst = stage_dir.join(&clean_name);
+            let is_first = src_path == first_vol;
+            if is_first {
+                first_clean_path = Some(dst.clone());
+                self.stage(format!(
+                    "[第{}层] 正在还原隐写分卷 ({}/{})...",
+                    depth + 1,
+                    idx + 1,
+                    total
+                ));
+                first_restorer
+                    .restore_to(&src_path, &dst, &self.cancel_flag, &mut |_| {})
+                    .map_err(map_stego_error)?;
+                restored_count += 1;
+            } else if let Some(sib_restorer) =
+                first_restorer.probe_split_sibling(first_vol, &src_path)
+            {
+                self.stage(format!(
+                    "[第{}层] 正在还原隐写分卷 ({}/{})...",
+                    depth + 1,
+                    idx + 1,
+                    total
+                ));
+                sib_restorer
+                    .restore_to(&src_path, &dst, &self.cancel_flag, &mut |_| {})
+                    .map_err(map_stego_error)?;
+                restored_count += 1;
+            } else if fs::hard_link(&src_path, &dst).is_err() {
+                fs::copy(&src_path, &dst).map_err(|e| {
+                    ExtractError::Fatal(format!("无法准备分卷文件 {clean_name}: {e}"))
+                })?;
+            }
+        }
+
+        let first_clean = first_clean_path
+            .ok_or_else(|| ExtractError::Fatal("未能还原首卷隐写分卷文件".into()))?;
+        Ok((guard, first_clean, restored_count, total))
+    }
+}
+
+fn map_stego_error(err: StegoError) -> ExtractError {
+    match err {
+        StegoError::Cancelled => ExtractError::Cancelled,
+        StegoError::Message(msg) => ExtractError::Fatal(msg),
+    }
 }
 
 enum EncryptionProbe {
@@ -1179,49 +1339,32 @@ fn find_disguised_split_siblings(
     out
 }
 
-fn carve_payload_to_temp(
-    src: &Path,
-    offset: u64,
-    fmt: ArchiveFormat,
-) -> Result<TempFileGuard, String> {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let temp_path = std::env::temp_dir().join(format!(
-        "ohunzip_carve_{}_{}.{}",
-        std::process::id(),
-        ts,
-        fmt.canonical_ext()
-    ));
-
-    let mut reader = File::open(src).map_err(|e| format!("无法读取源文件: {e}"))?;
-    reader
-        .seek(SeekFrom::Start(offset))
-        .map_err(|e| format!("无法定位隐写偏移: {e}"))?;
-    let mut writer =
-        File::create(&temp_path).map_err(|e| format!("无法创建临时载荷文件: {e}"))?;
-
-    let mut buf = vec![0u8; 1024 * 1024];
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| format!("读取源文件失败: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        writer
-            .write_all(&buf[..n])
-            .map_err(|e| format!("写入临时载荷文件失败: {e}"))?;
+/// Finds all sibling split volumes along with their restored clean filenames (works for both
+/// disguised splits like `movie.7z.001.mp4` and standard splits like `movie.7z.001` / `.part1.rar`).
+fn find_split_siblings_with_clean_names(
+    first_vol: &Path,
+    detected: &DetectedArchive,
+) -> Vec<(PathBuf, String)> {
+    if let Some(ref info) = detected.disguised_split {
+        return find_disguised_split_siblings(first_vol, info);
     }
-    writer
-        .flush()
-        .map_err(|e| format!("刷新临时文件失败: {e}"))?;
-
-    Ok(TempFileGuard(temp_path))
+    let mut out: Vec<(PathBuf, String)> = collect_source_files_to_trash(first_vol, detected)
+        .into_iter()
+        .map(|p| {
+            let clean = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("vol")
+                .to_string();
+            (p, clean)
+        })
+        .collect();
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out
 }
 
-/// Produce a clean folder stem name from an archive filename (stripping `.tar.gz`, `.part1.rar`, `.7z.001`, disguised splits, etc.).
+/// Produce a clean folder stem name from an archive filename (stripping `.tar.gz`, `.part1.rar`,
+/// `.7z.001`, disguised splits, and Apate double extensions like `.zip.mp4` / `.tar.gz.mp4`).
 pub fn clean_archive_stem(path: &Path) -> String {
     let raw_name = path
         .file_name()
@@ -1231,7 +1374,7 @@ pub fn clean_archive_stem(path: &Path) -> String {
     // If it's a disguised split like `movie.7z.001.mp4`, strip the disguise first
     let normalized = detector::parse_disguised_split_filename(raw_name)
         .map(|info| info.clean_filename())
-        .unwrap_or_else(|| raw_name.to_string());
+        .unwrap_or_else(|| detector::strip_outer_disguise_exts(raw_name));
 
     let name = normalized.as_str();
     let lower = name.to_ascii_lowercase();
@@ -1474,6 +1617,12 @@ mod tests {
         assert_eq!(clean_archive_stem(Path::new("movie.7z.001.mp4")), "movie");
         assert_eq!(clean_archive_stem(Path::new("pack.part01.rar删")), "pack");
         assert_eq!(clean_archive_stem(Path::new("secret.mp4")), "secret");
+        assert_eq!(clean_archive_stem(Path::new("secret.zip.mp4")), "secret");
+        assert_eq!(clean_archive_stem(Path::new("secret.zip.mp4.jpg")), "secret");
+        assert_eq!(clean_archive_stem(Path::new("backup.tar.gz.mp4")), "backup");
+        assert_eq!(clean_archive_stem(Path::new("backup.tar.gz.mp4.exe")), "backup");
+        assert_eq!(clean_archive_stem(Path::new("movie.7z.001.mp4.jpg")), "movie");
+        assert_eq!(clean_archive_stem(Path::new("my.v1.2.mp4")), "my.v1.2");
     }
 
     #[test]
@@ -1482,5 +1631,244 @@ mod tests {
         assert_eq!(parse_latest_progress_percent(" 12% 3 - file.bin\r 47%"), Some(47));
         assert_eq!(parse_latest_progress_percent("100% Everything is Ok"), Some(100));
         assert_eq!(parse_latest_progress_percent("Scanning..."), None);
+    }
+
+    fn apate_disguise_bytes(orig: &[u8], mask: &[u8]) -> Vec<u8> {
+        let mut out = if orig.len() >= mask.len() {
+            orig.to_vec()
+        } else {
+            vec![0u8; mask.len()]
+        };
+        let head_len = orig.len().min(mask.len());
+        let mut rev_head = orig[..head_len].to_vec();
+        rev_head.reverse();
+        out[..mask.len()].copy_from_slice(mask);
+        out.extend_from_slice(&rev_head);
+        out.extend_from_slice(&(mask.len() as i32).to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn test_apate_end_to_end_extraction_with_7z() {
+        let Some(sz) = crate::seven_zip::detect_seven_zip("") else {
+            return;
+        };
+
+        let dir = std::env::temp_dir().join("oh_unzip_apate_e2e_tests");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let payload_file = dir.join("hello.txt");
+        let payload_bytes = b"Hello from OhUnzip Apate steganography test!\n".repeat(400);
+        fs::write(&payload_file, &payload_bytes).unwrap();
+
+        // 1. Single ZIP archive disguised with Apate OneKey-like big MP4 mask (orig < mask)
+        let raw_zip = dir.join("sample.zip");
+        let status = new_hidden_command(&sz.path)
+            .args(["a", "-tzip", "-y"])
+            .arg(&raw_zip)
+            .arg(&payload_file)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let zip_bytes = fs::read(&raw_zip).unwrap();
+        let mut mp4_mask = vec![0xABu8; 64 * 1024];
+        mp4_mask[..32].copy_from_slice(&[
+            0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x6D, 0x00, 0x00,
+            0x02, 0x00, 0x69, 0x73, 0x6F, 0x6D, 0x69, 0x73, 0x6F, 0x32, 0x61, 0x76, 0x63, 0x31,
+            0x6D, 0x70, 0x34, 0x31,
+        ]);
+        let apate_zip = dir.join("sample.zip.mp4");
+        fs::write(&apate_zip, apate_disguise_bytes(&zip_bytes, &mp4_mask)).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.move_source_to_trash = true; // Verify stego carrier is NEVER trashed!
+        let (tx, rx) = mpsc::channel();
+        run_extraction_job(
+            apate_zip.clone(),
+            sz.path.clone(),
+            cfg.clone(),
+            None,
+            OutputTarget::SameDir,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+
+        let mut completed_dir = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let ExtractEvent::Completed { output_dir, .. } = ev {
+                completed_dir = Some(output_dir);
+            }
+        }
+        let out_dir = completed_dir.expect("Apate single ZIP extraction should succeed");
+        assert_eq!(out_dir.file_name().and_then(|n| n.to_str()), Some("sample"));
+        assert_eq!(fs::read(out_dir.join("hello.txt")).unwrap(), payload_bytes);
+        assert!(apate_zip.exists(), "Apate source file must never be trashed or mutated");
+
+        // 2. Polyglot JPEG + ZIP end-to-end extraction via OffsetRestorer
+        let poly_jpg = dir.join("cover.jpg");
+        let mut poly_bytes = vec![
+            0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0xFF, 0xD9,
+        ];
+        poly_bytes.extend_from_slice(&zip_bytes);
+        fs::write(&poly_jpg, &poly_bytes).unwrap();
+
+        let (tx_p, rx_p) = mpsc::channel();
+        run_extraction_job(
+            poly_jpg.clone(),
+            sz.path.clone(),
+            cfg.clone(),
+            None,
+            OutputTarget::SameDir,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            tx_p,
+        );
+        let mut poly_out_dir = None;
+        while let Ok(ev) = rx_p.try_recv() {
+            if let ExtractEvent::Completed { output_dir, .. } = ev {
+                poly_out_dir = Some(output_dir);
+            }
+        }
+        let poly_out = poly_out_dir.expect("Polyglot JPEG+ZIP extraction should succeed");
+        assert_eq!(fs::read(poly_out.join("hello.txt")).unwrap(), payload_bytes);
+        assert!(poly_jpg.exists(), "Polyglot carrier file must never be trashed");
+
+        // 3. Split 7z archive (`splitpack.7z.001.mp4` + `.002.mp4` + ...) disguised with Apate
+        let split_dir = dir.join("splits");
+        fs::create_dir_all(&split_dir).unwrap();
+        let big_payload = split_dir.join("data.bin");
+        let big_bytes: Vec<u8> = (0..12_000).map(|i| ((i * 73 + 11) & 0xFF) as u8).collect();
+        fs::write(&big_payload, &big_bytes).unwrap();
+
+        let raw_7z_base = split_dir.join("splitpack.7z");
+        let status2 = new_hidden_command(&sz.path)
+            .args(["a", "-t7z", "-mx=0", "-v4k", "-y"])
+            .arg(&raw_7z_base)
+            .arg(&big_payload)
+            .status()
+            .unwrap();
+        assert!(status2.success());
+
+        // Disguise every split volume with Apate JPG 4-byte mask and append `.mp4`
+        let jpg_mask = [0xFFu8, 0xD8, 0xFF, 0xE1];
+        let mut disguised_first = None;
+        for entry in fs::read_dir(&split_dir).unwrap().flatten() {
+            let p = entry.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with("splitpack.7z.") {
+                let raw = fs::read(&p).unwrap();
+                let new_path = split_dir.join(format!("{name}.mp4"));
+                fs::write(&new_path, apate_disguise_bytes(&raw, &jpg_mask)).unwrap();
+                fs::remove_file(&p).unwrap();
+                if name.ends_with(".001") {
+                    disguised_first = Some(new_path);
+                }
+            }
+        }
+        let first_vol = disguised_first.expect("split .001 volume must exist");
+
+        let (tx2, rx2) = mpsc::channel();
+        run_extraction_job(
+            first_vol,
+            sz.path.clone(),
+            cfg.clone(),
+            None,
+            OutputTarget::SameDir,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            tx2,
+        );
+
+        let mut split_out_dir = None;
+        while let Ok(ev) = rx2.try_recv() {
+            if let ExtractEvent::Completed { output_dir, .. } = ev {
+                split_out_dir = Some(output_dir);
+            }
+        }
+        let split_out = split_out_dir.expect("Apate split 7z extraction should succeed");
+        assert_eq!(fs::read(split_out.join("data.bin")).unwrap(), big_bytes);
+
+        // 4. Stacked 2-layer Apate single ZIP (`double.zip.mp4.jpg`: inner MP4 64KB + outer JPG 4B)
+        let double_layer_bytes =
+            apate_disguise_bytes(&apate_disguise_bytes(&zip_bytes, &mp4_mask), &jpg_mask);
+        let double_apate = dir.join("double.zip.mp4.jpg");
+        fs::write(&double_apate, &double_layer_bytes).unwrap();
+
+        let (tx3, rx3) = mpsc::channel();
+        run_extraction_job(
+            double_apate.clone(),
+            sz.path.clone(),
+            cfg.clone(),
+            None,
+            OutputTarget::SameDir,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            tx3,
+        );
+        let mut double_out_dir = None;
+        while let Ok(ev) = rx3.try_recv() {
+            if let ExtractEvent::Completed { output_dir, .. } = ev {
+                double_out_dir = Some(output_dir);
+            }
+        }
+        let double_out = double_out_dir.expect("2-layer stacked Apate ZIP extraction should succeed");
+        assert_eq!(double_out.file_name().and_then(|n| n.to_str()), Some("double"));
+        assert_eq!(fs::read(double_out.join("hello.txt")).unwrap(), payload_bytes);
+        assert!(double_apate.exists());
+
+        // 5. Stacked 2-layer Apate split 7z (`splits2/multi.7z.001.mp4.jpg` + `.002.mp4.jpg` + ...)
+        let split2_dir = dir.join("splits2");
+        fs::create_dir_all(&split2_dir).unwrap();
+        let raw_7z_base2 = split2_dir.join("multi.7z");
+        let status3 = new_hidden_command(&sz.path)
+            .args(["a", "-t7z", "-mx=0", "-v4k", "-y"])
+            .arg(&raw_7z_base2)
+            .arg(&big_payload)
+            .status()
+            .unwrap();
+        assert!(status3.success());
+
+        let mut disguised_first2 = None;
+        for entry in fs::read_dir(&split2_dir).unwrap().flatten() {
+            let p = entry.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with("multi.7z.") {
+                let raw = fs::read(&p).unwrap();
+                let l1 = apate_disguise_bytes(&raw, &mp4_mask);
+                let l2 = apate_disguise_bytes(&l1, &jpg_mask);
+                let new_path = split2_dir.join(format!("{name}.mp4.jpg"));
+                fs::write(&new_path, &l2).unwrap();
+                fs::remove_file(&p).unwrap();
+                if name.ends_with(".001") {
+                    disguised_first2 = Some(new_path);
+                }
+            }
+        }
+        let first_vol2 = disguised_first2.expect("2-layer split .001 volume must exist");
+
+        let (tx4, rx4) = mpsc::channel();
+        run_extraction_job(
+            first_vol2,
+            sz.path.clone(),
+            cfg,
+            None,
+            OutputTarget::SameDir,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            tx4,
+        );
+        let mut split2_out_dir = None;
+        while let Ok(ev) = rx4.try_recv() {
+            if let ExtractEvent::Completed { output_dir, .. } = ev {
+                split2_out_dir = Some(output_dir);
+            }
+        }
+        let split2_out = split2_out_dir.expect("2-layer stacked Apate split 7z should succeed");
+        assert_eq!(fs::read(split2_out.join("data.bin")).unwrap(), big_bytes);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

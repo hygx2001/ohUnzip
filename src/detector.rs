@@ -1,6 +1,9 @@
+use crate::stego::{self, ProbeContext, ProbeCost, StegoMatch, StegoRestorer};
+use std::fmt;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFormat {
@@ -196,11 +199,42 @@ impl ArchiveFormat {
     }
 }
 
+/// Read-only random-access byte view over a raw file or a virtually-decoded steganography stream.
+/// Any [`crate::stego::StegoCodec`] that implements this trait automatically reuses every archive
+/// format validator (7z CRC32, RAR5/RAR4 CRC, ZIP/ZIP64 EOCD, TAR checksum, Office/EPUB guard).
+pub trait ByteSource {
+    fn len(&self) -> u64;
+    fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()>;
+}
+
+/// [`ByteSource`] backed directly by a regular [`File`].
+pub struct FileSource<'a> {
+    file: &'a mut File,
+    len: u64,
+}
+
+impl<'a> FileSource<'a> {
+    pub fn new(file: &'a mut File, len: u64) -> Self {
+        Self { file, len }
+    }
+}
+
+impl ByteSource for FileSource<'_> {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.read_exact(buf)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrickKind {
     Normal,
     DisguisedExtension { original_ext: String },
-    Polyglot { carrier: String, offset: u64 },
+    Stego { tool: &'static str, badge: String },
     SplitVolume { label: String },
 }
 
@@ -215,12 +249,7 @@ impl TrickKind {
                     Some(format!("改后缀 .{} → {}", original_ext, fmt.display_name()))
                 }
             }
-            Self::Polyglot { carrier, offset } => Some(format!(
-                "隐写/{} ({} @ {})",
-                carrier,
-                fmt.display_name(),
-                format_bytes(*offset)
-            )),
+            Self::Stego { badge, .. } => Some(badge.clone()),
             Self::SplitVolume { label } => Some(format!("分卷 {} ({label})", fmt.display_name())),
         }
     }
@@ -228,20 +257,57 @@ impl TrickKind {
     pub fn is_tricky(&self) -> bool {
         matches!(
             self,
-            Self::DisguisedExtension { .. } | Self::Polyglot { .. }
+            Self::DisguisedExtension { .. } | Self::Stego { .. }
         )
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct DetectedArchive {
     pub format: ArchiveFormat,
-    /// Byte offset where the archive stream begins. `0` for regular/disguised files, `> 0` for polyglots.
-    pub offset: u64,
     pub trick: TrickKind,
     pub is_split: bool,
     /// Set when this is a disguised split first volume (e.g. `foo.7z.001.mp4`, `bar.part1.rar删`).
     pub disguised_split: Option<DisguisedSplitInfo>,
+    /// Set when the archive is wrapped by a steganography/polyglot codec and must be restored first.
+    pub stego: Option<Arc<dyn StegoRestorer>>,
+}
+
+impl fmt::Debug for DetectedArchive {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DetectedArchive")
+            .field("format", &self.format)
+            .field("trick", &self.trick)
+            .field("is_split", &self.is_split)
+            .field("disguised_split", &self.disguised_split)
+            .field("stego", &self.stego.as_ref().map(|s| s.tool_id()))
+            .finish()
+    }
+}
+
+impl DetectedArchive {
+    pub fn from_stego_match(m: StegoMatch) -> Self {
+        let tool = m.restorer.tool_id();
+        let badge = m.restorer.badge_text(m.format);
+        Self {
+            format: m.format,
+            trick: TrickKind::Stego { tool, badge },
+            is_split: m.is_split,
+            disguised_split: m.disguised_split,
+            stego: Some(m.restorer),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn stego_tool(&self) -> Option<&'static str> {
+        self.stego.as_ref().map(|s| s.tool_id())
+    }
+
+    /// True if the source file is a steganography/polyglot carrier whose original file
+    /// should NEVER be auto-deleted or moved to Recycle Bin.
+    pub fn is_stego_carrier(&self) -> bool {
+        self.stego.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -287,7 +353,7 @@ pub fn is_protected_component_ext(ext: &str) -> bool {
 
 /// Extensions of Office/ebook documents where someone *occasionally* renames a real zip to `.docx`
 /// when dropping a file directly at top-level. We check internal markers to tell a real `.docx`
-/// apart from a fake `.docx` ONLY for these extensions when `allow_fake_doc_check` is true.
+/// apart from a fake `.docx` ONLY for these extensions.
 fn is_inspectable_doc_ext(ext: &str) -> bool {
     matches!(ext, "docx" | "xlsx" | "pptx" | "epub")
 }
@@ -359,8 +425,6 @@ pub fn parse_disguised_split_filename(name: &str) -> Option<DisguisedSplitInfo> 
                 // Avoid matching year/date stamps like `foo.2026.mp4` (4-digit years 1900..2100)
                 if let Ok(part_num) = num_str.parse::<u32>() {
                     if (1..=999).contains(&part_num) && !(digit_len == 4 && part_num >= 1900) {
-                        // Require either an archive hint before `.001` (like `.7z.001`, `.zip.001`, `.rar.001`)
-                        // OR a clearly non-date 3-digit volume like `.001`..`.999`
                         if digit_len == 3 {
                             return Some(DisguisedSplitInfo {
                                 prefix: name[..i + 1].to_string(),
@@ -476,12 +540,12 @@ fn infer_split_format_from_name(path: &Path) -> ArchiveFormat {
     ArchiveFormat::Generic
 }
 
-/// Detect whether `path` is an archive (normal, disguised extension, split volume, or polyglot/stego).
-/// `is_nested`: true when scanning inside an already-extracted directory (stricter against false positives).
+/// Detect whether `path` is an archive (normal, disguised extension, split volume, or stego/polyglot).
 pub fn detect_file(path: &Path, opts: DetectOptions) -> Option<DetectedArchive> {
     detect_file_with_context(path, opts, false)
 }
 
+/// `is_nested`: true when scanning inside an already-extracted directory (stricter against false positives).
 pub fn detect_file_with_context(
     path: &Path,
     opts: DetectOptions,
@@ -509,10 +573,6 @@ pub fn detect_file_with_context(
     // Protect software/library/package components (`.jar`, `.whl`, `.lib`, `.a`, `.apk`, `.dll`, etc.)
     // They are real components, NOT disguised archives!
     if opts.skip_office_zip && is_protected_component_ext(&ext) {
-        // For top-level `.docx`/`.xlsx`/`.pptx`/`.epub` explicitly dropped by user, still allow
-        // detecting if someone renamed a plain zip/7z/rar to `.docx` (i.e. NOT a real Office doc).
-        // For all other components (`.jar`, `.whl`, `.lib`, `.a`, `.apk`, `.vsix`, etc.) or nested files,
-        // skip unconditionally!
         if is_nested || !is_inspectable_doc_ext(&ext) {
             return None;
         }
@@ -535,12 +595,29 @@ pub fn detect_file_with_context(
     if let Some(fmt) = detect_magic_at_start(&header, &mut file, file_len, &ext) {
         let is_expected_ext = fmt.known_extensions().contains(&ext.as_str());
 
-        // If top-level `.docx`/`.xlsx`/`.pptx`/`.epub` is actually a real Office/EPUB document, skip it
+        // If top-level `.docx`/`.xlsx`/`.pptx`/`.epub` is actually a real Office/EPUB document,
+        // still allow fast O(1) stego codecs (e.g. a `.docx` used as an Apate mask), otherwise skip it.
         if fmt == ArchiveFormat::Zip
             && !is_expected_ext
             && opts.skip_office_zip
-            && is_real_zip_document(&header, &mut file, file_len, &ext)
+            && is_real_zip_document_source(&header, &mut FileSource::new(&mut file, file_len), &ext)
         {
+            if opts.detect_polyglot {
+                let mut ctx = ProbeContext {
+                    path,
+                    file: &mut file,
+                    file_len,
+                    header: &header,
+                    ext: &ext,
+                    opts,
+                    is_nested,
+                    is_split,
+                    disguised_split: disguised_split_first.as_ref(),
+                };
+                if let Some(matched) = stego::probe_tier(ProbeCost::FastHeaderOrTail, &mut ctx) {
+                    return Some(DetectedArchive::from_stego_match(matched));
+                }
+            }
             return None;
         }
 
@@ -549,10 +626,10 @@ pub fn detect_file_with_context(
                 let label = format!("改后缀分卷 {}", info.clean_filename());
                 return Some(DetectedArchive {
                     format: fmt,
-                    offset: 0,
                     trick: TrickKind::SplitVolume { label },
                     is_split: true,
                     disguised_split: Some(info),
+                    stego: None,
                 });
             }
         }
@@ -560,20 +637,20 @@ pub fn detect_file_with_context(
         if let Some(label) = split_label {
             return Some(DetectedArchive {
                 format: fmt,
-                offset: 0,
                 trick: TrickKind::SplitVolume { label },
                 is_split: true,
                 disguised_split: None,
+                stego: None,
             });
         }
 
         if is_expected_ext {
             return Some(DetectedArchive {
                 format: fmt,
-                offset: 0,
                 trick: TrickKind::Normal,
                 is_split,
                 disguised_split: None,
+                stego: None,
             });
         }
 
@@ -581,13 +658,32 @@ pub fn detect_file_with_context(
         if opts.detect_disguised && fmt.allow_disguised_detection() {
             return Some(DetectedArchive {
                 format: fmt,
-                offset: 0,
                 trick: TrickKind::DisguisedExtension { original_ext: ext },
                 is_split,
                 disguised_split: None,
+                stego: None,
             });
         } else {
             return None;
+        }
+    }
+
+    // 1.5. Fast O(1) steganography codecs (e.g. Apate) run BEFORE name-only split/extension fallbacks
+    // so stego-disguised split volumes (like `movie.7z.001.mp4`) are restored instead of misclassified.
+    if opts.detect_polyglot {
+        let mut ctx = ProbeContext {
+            path,
+            file: &mut file,
+            file_len,
+            header: &header,
+            ext: &ext,
+            opts,
+            is_nested,
+            is_split,
+            disguised_split: disguised_split_first.as_ref(),
+        };
+        if let Some(matched) = stego::probe_tier(ProbeCost::FastHeaderOrTail, &mut ctx) {
+            return Some(DetectedArchive::from_stego_match(matched));
         }
     }
 
@@ -597,10 +693,10 @@ pub fn detect_file_with_context(
             let label = format!("改后缀分卷 {}", info.clean_filename());
             return Some(DetectedArchive {
                 format: infer_split_format_from_name(Path::new(&info.clean_filename())),
-                offset: 0,
                 trick: TrickKind::SplitVolume { label },
                 is_split: true,
                 disguised_split: Some(info),
+                stego: None,
             });
         }
     }
@@ -608,35 +704,38 @@ pub fn detect_file_with_context(
     if let Some(label) = split_label {
         return Some(DetectedArchive {
             format: infer_split_format_from_name(path),
-            offset: 0,
             trick: TrickKind::SplitVolume { label },
             is_split: true,
             disguised_split: None,
+            stego: None,
         });
     }
 
     if let Some(ext_fmt) = ArchiveFormat::from_extension(&ext) {
         return Some(DetectedArchive {
             format: ext_fmt,
-            offset: 0,
             trick: TrickKind::Normal,
             is_split: false,
             disguised_split: None,
+            stego: None,
         });
     }
 
-    // 3. Polyglot / Steganography / Appended Archive scan (offset > 0)
-    // Skip polyglot scan on protected component files (e.g. `.exe` installers/dlls inside a software tree)
-    if opts.detect_polyglot && (!is_nested || !matches!(ext.as_str(), "exe" | "dll" | "so" | "dylib" | "pyd" | "node")) {
-        let carrier = detect_carrier_kind(&header, &ext);
-        if let Some((fmt, offset)) = scan_embedded_archive(&mut file, file_len) {
-            return Some(DetectedArchive {
-                format: fmt,
-                offset,
-                trick: TrickKind::Polyglot { carrier, offset },
-                is_split: false,
-                disguised_split: None,
-            });
+    // 3. Fallback steganography / polyglot scan codecs (tail-window & linear scans)
+    if opts.detect_polyglot {
+        let mut ctx = ProbeContext {
+            path,
+            file: &mut file,
+            file_len,
+            header: &header,
+            ext: &ext,
+            opts,
+            is_nested,
+            is_split: false,
+            disguised_split: None,
+        };
+        if let Some(matched) = stego::probe_tier(ProbeCost::FallbackScan, &mut ctx) {
+            return Some(DetectedArchive::from_stego_match(matched));
         }
     }
 
@@ -736,6 +835,151 @@ fn detect_magic_at_start(
     None
 }
 
+/// Strictly validates whether a [`ByteSource`] represents a real archive (using CRC32/CRC16/EOCD/
+/// checksum validation to prevent false positives) and applies Office/component protection.
+/// Designed to be shared by any [`crate::stego::StegoCodec`] backed by a [`ByteSource`].
+pub fn detect_strict_archive_in_source(
+    src: &mut dyn ByteSource,
+    inner_ext: &str,
+    opts: DetectOptions,
+    is_split: bool,
+) -> Option<ArchiveFormat> {
+    let total_len = src.len();
+    if total_len < 16 {
+        return None;
+    }
+
+    let header_len = total_len.min(4096) as usize;
+    let mut header = vec![0u8; header_len];
+    src.read_exact_at(0, &mut header).ok()?;
+
+    let fmt = detect_strict_format_from_source(&header, src, inner_ext, is_split)?;
+
+    // Respect Office/component protection if a real `.docx`/`.jar`/etc. was wrapped
+    if fmt == ArchiveFormat::Zip && opts.skip_office_zip {
+        if is_protected_component_ext(inner_ext) && !is_inspectable_doc_ext(inner_ext) {
+            return None;
+        }
+        if !matches!(inner_ext, "zip" | "zipx")
+            && is_real_zip_document_source(&header, src, inner_ext)
+        {
+            return None;
+        }
+    }
+
+    Some(fmt)
+}
+
+fn detect_strict_format_from_source(
+    header: &[u8],
+    src: &mut dyn ByteSource,
+    inner_ext: &str,
+    is_split: bool,
+) -> Option<ArchiveFormat> {
+    // 7z: 6-byte magic + major version 0 + CRC32 over header[12..32]
+    if header.len() >= 32
+        && &header[0..6] == b"7z\xBC\xAF\x27\x1C"
+        && validate_7z_start_header(&header[0..32])
+    {
+        return Some(ArchiveFormat::SevenZ);
+    }
+
+    // RAR5: 8-byte signature + main header CRC32
+    if header.len() >= 16
+        && &header[0..8] == b"Rar!\x1A\x07\x01\x00"
+        && validate_rar5_header_at(src, 0)
+    {
+        return Some(ArchiveFormat::Rar);
+    }
+
+    // RAR4: 7-byte signature + MAIN_HEAD (0x73) + CRC16
+    if header.len() >= 20
+        && &header[0..7] == b"Rar!\x1A\x07\x00"
+        && validate_rar4_header(header)
+    {
+        return Some(ArchiveFormat::Rar);
+    }
+
+    // ZIP: PK\x03\x04 / PK\x05\x06 / PK\x07\x08 + structural EOCD / ZIP64 / local header check
+    if header.len() >= 22
+        && header[0] == 0x50
+        && header[1] == 0x4B
+        && matches!((header[2], header[3]), (0x03, 0x04) | (0x05, 0x06) | (0x07, 0x08))
+        && validate_zip_source(src, header, is_split)
+    {
+        return Some(ArchiveFormat::Zip);
+    }
+
+    // XZ: 6-byte magic + 4-byte CRC32 of 2-byte stream flags
+    if header.len() >= 12 && &header[0..6] == b"\xFD7zXZ\x00" {
+        let expected_crc = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+        if crc32fast::hash(&header[6..8]) == expected_crc {
+            return Some(ArchiveFormat::Xz);
+        }
+    }
+
+    // BZIP2: 10-byte magic (`BZh[1-9]` + pi / sqrt(pi) block signature)
+    if header.len() >= 10
+        && &header[0..3] == b"BZh"
+        && (b'1'..=b'9').contains(&header[3])
+        && (&header[4..10] == b"\x31\x41\x59\x26\x53\x59"
+            || &header[4..10] == b"\x17\x72\x45\x38\x50\x90")
+    {
+        return Some(ArchiveFormat::Bzip2);
+    }
+
+    // GZIP: 1F 8B 08 + valid reserved flag bits, XFL, and OS byte
+    if header.len() >= 18
+        && header[0] == 0x1F
+        && header[1] == 0x8B
+        && header[2] == 0x08
+        && (header[3] & 0xE0) == 0
+        && matches!(header[8], 0 | 2 | 4)
+        && (header[9] <= 13 || header[9] == 255)
+    {
+        return Some(ArchiveFormat::Gzip);
+    }
+
+    // ZSTD: 28 B5 2F FD + reserved bit 3 of Frame_Header_Descriptor must be 0
+    if header.len() >= 16
+        && header[0..4] == [0x28, 0xB5, 0x2F, 0xFD]
+        && (header[4] & 0x08) == 0
+    {
+        return Some(ArchiveFormat::Zstd);
+    }
+
+    // TAR: "ustar" at offset 257 + valid 512-byte header checksum
+    if header.len() >= 512
+        && (&header[257..263] == b"ustar\0" || &header[257..263] == b"ustar ")
+        && validate_tar_header_checksum(&header[0..512])
+    {
+        return Some(ArchiveFormat::Tar);
+    }
+
+    // Explicit container formats when the inner filename clearly indicates them
+    if inner_ext == "cab"
+        && header.len() >= 16
+        && &header[0..4] == b"MSCF"
+        && header[4..8] == [0, 0, 0, 0]
+        && header[12..16] == [0, 0, 0, 0]
+    {
+        return Some(ArchiveFormat::Cab);
+    }
+
+    if matches!(inner_ext, "wim" | "esd") && header.len() >= 8 && &header[0..8] == b"MSWIM\0\0\0" {
+        return Some(ArchiveFormat::Wim);
+    }
+
+    if inner_ext == "iso" && src.len() >= 0x8008 {
+        let mut buf = [0u8; 7];
+        if src.read_exact_at(0x8000, &mut buf).is_ok() && &buf == b"\x01CD001\x01" {
+            return Some(ArchiveFormat::Iso);
+        }
+    }
+
+    None
+}
+
 /// Validates a 32-byte 7z signature header using its embedded CRC32.
 pub fn validate_7z_start_header(hdr: &[u8]) -> bool {
     if hdr.len() < 32 || &hdr[0..6] != b"7z\xBC\xAF\x27\x1C" {
@@ -750,102 +994,108 @@ pub fn validate_7z_start_header(hdr: &[u8]) -> bool {
     expected_crc == actual_crc
 }
 
-/// Distinguishes genuine Office/EPUB ZIP-based documents from a plain ZIP renamed to `.docx`.
-fn is_real_zip_document(header: &[u8], file: &mut File, file_len: u64, ext: &str) -> bool {
-    let mut probe_buf = header.to_vec();
-    if file_len > 4096 {
-        let tail_size = file_len.min(65536) as usize;
-        let mut tail = vec![0u8; tail_size];
-        if file.seek(SeekFrom::Start(file_len - tail_size as u64)).is_ok()
-            && file.read_exact(&mut tail).is_ok()
-        {
-            probe_buf.extend_from_slice(&tail);
+/// Validates a RAR4 signature + `MAIN_HEAD` (0x73) header using its embedded CRC16.
+pub fn validate_rar4_header(hdr: &[u8]) -> bool {
+    if hdr.len() < 20 || &hdr[0..7] != b"Rar!\x1A\x07\x00" || hdr[9] != 0x73 {
+        return false;
+    }
+    let head_size = u16::from_le_bytes([hdr[12], hdr[13]]) as usize;
+    if head_size < 13 || 7 + head_size > hdr.len() {
+        return false;
+    }
+    let expected_crc16 = u16::from_le_bytes([hdr[7], hdr[8]]);
+    let actual_crc16 = (crc32fast::hash(&hdr[9..7 + head_size]) & 0xFFFF) as u16;
+    expected_crc16 == actual_crc16
+}
+
+/// Validates a RAR5 header starting at `abs_pos` inside `src` using its embedded CRC32.
+pub fn validate_rar5_header_at(src: &mut dyn ByteSource, abs_pos: u64) -> bool {
+    let total_len = src.len();
+    if abs_pos.checked_add(16).is_none_or(|end| end > total_len) {
+        return false;
+    }
+    let avail = (total_len - (abs_pos + 8)).min(64) as usize;
+    let mut head = [0u8; 64];
+    if src.read_exact_at(abs_pos + 8, &mut head[..avail]).is_err() {
+        return false;
+    }
+    let expected_crc = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
+
+    let mut header_size: u64 = 0;
+    let mut shift = 0;
+    let mut vint_len = 0;
+    let mut found_end = false;
+    for &b in &head[4..avail] {
+        vint_len += 1;
+        header_size |= ((b & 0x7F) as u64) << shift;
+        if (b & 0x80) == 0 {
+            found_end = true;
+            break;
+        }
+        shift += 7;
+        if shift > 28 {
+            return false;
         }
     }
 
-    let contains_marker = |marker: &[u8]| {
-        probe_buf
-            .windows(marker.len())
-            .any(|w| w.eq_ignore_ascii_case(marker))
+    if !found_end || header_size == 0 || header_size > 4096 {
+        return false;
+    }
+    let total_crc_data = vint_len + header_size as usize;
+    if abs_pos
+        .checked_add(12)
+        .and_then(|v| v.checked_add(total_crc_data as u64))
+        .is_none_or(|end| end > total_len)
+    {
+        return false;
+    }
+
+    let mut crc_buf = vec![0u8; total_crc_data];
+    if src.read_exact_at(abs_pos + 12, &mut crc_buf).is_err() {
+        return false;
+    }
+    crc32fast::hash(&crc_buf) == expected_crc
+}
+
+/// Validates a ZIP / ZIP64 archive inside `src` (checks EOCD / ZIP64 Locator, or Local File Header for splits).
+pub fn validate_zip_source(src: &mut dyn ByteSource, header: &[u8], is_split: bool) -> bool {
+    let total_len = src.len();
+
+    // Empty ZIP: starts directly with EOCD (`PK\x05\x06`)
+    if header.len() >= 22 && header[0..4] == [0x50, 0x4B, 0x05, 0x06] {
+        let comment_len = u16::from_le_bytes([header[20], header[21]]) as u64;
+        return 22 + comment_len == total_len;
+    }
+
+    // Must start with Local File Header (`PK\x03\x04`) or Spanned Marker (`PK\x07\x08` + `PK\x03\x04`)
+    let lh_off = if header.len() >= 34
+        && header[0..4] == [0x50, 0x4B, 0x07, 0x08]
+        && header[4..8] == [0x50, 0x4B, 0x03, 0x04]
+    {
+        4usize
+    } else if header.len() >= 30 && header[0..4] == [0x50, 0x4B, 0x03, 0x04] {
+        0usize
+    } else {
+        return false;
     };
 
-    let has_office_marker = contains_marker(b"[Content_Types].xml")
-        && (contains_marker(b"word/")
-            || contains_marker(b"xl/")
-            || contains_marker(b"ppt/")
-            || contains_marker(b"_rels/.rels"));
-    let has_epub_marker = contains_marker(b"application/epub+zip")
-        || (contains_marker(b"META-INF/container.xml") && ext == "epub");
-
-    has_office_marker || has_epub_marker
-}
-
-fn detect_carrier_kind(header: &[u8], ext: &str) -> String {
-    if header.len() >= 3 && header[0..3] == [0xFF, 0xD8, 0xFF] {
-        return "JPEG图种".into();
-    }
-    if header.len() >= 8 && header[0..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
-        return "PNG图种".into();
-    }
-    if header.len() >= 6 && (&header[0..6] == b"GIF87a" || &header[0..6] == b"GIF89a") {
-        return "GIF图种".into();
-    }
-    if header.len() >= 12 && &header[0..4] == b"RIFF" && &header[8..12] == b"WEBP" {
-        return "WEBP图种".into();
-    }
-    if header.len() >= 2 && &header[0..2] == b"BM" {
-        return "BMP图种".into();
-    }
-    if header.len() >= 12 && &header[4..8] == b"ftyp" {
-        return "MP4视频种".into();
-    }
-    if header.len() >= 4 && header[0..4] == [0x1A, 0x45, 0xDF, 0xA3] {
-        return "MKV视频种".into();
-    }
-    if header.len() >= 12 && &header[0..4] == b"RIFF" && &header[8..12] == b"AVI " {
-        return "AVI视频种".into();
-    }
-    if header.len() >= 4 && &header[0..4] == b"%PDF" {
-        return "PDF隐写".into();
-    }
-    if header.len() >= 3 && (&header[0..3] == b"ID3" || (header[0] == 0xFF && (header[1] & 0xE0) == 0xE0)) {
-        return "音频隐写".into();
-    }
-    if header.len() >= 4 && &header[0..4] == b"fLaC" {
-        return "FLAC隐写".into();
-    }
-    if header.len() >= 2 && &header[0..2] == b"MZ" {
-        return "EXE自解压/捆绑".into();
-    }
-    if !ext.is_empty() {
-        format!(".{ext}隐写")
-    } else {
-        "文件拼接隐写".into()
-    }
-}
-
-/// Scans a non-archive carrier file for an embedded/appended ZIP, 7z, or RAR archive.
-fn scan_embedded_archive(file: &mut File, file_len: u64) -> Option<(ArchiveFormat, u64)> {
-    if let Some(zip_offset) = find_embedded_zip_eocd(file, file_len) {
-        return Some((ArchiveFormat::Zip, zip_offset));
+    if is_split {
+        let version = u16::from_le_bytes([header[lh_off + 4], header[lh_off + 5]]) & 0xFF;
+        let method = u16::from_le_bytes([header[lh_off + 8], header[lh_off + 9]]);
+        let fname_len = u16::from_le_bytes([header[lh_off + 26], header[lh_off + 27]]) as usize;
+        return version <= 63
+            && matches!(method, 0 | 8 | 9 | 12 | 14 | 93 | 95 | 98 | 99)
+            && fname_len > 0
+            && fname_len <= 1024;
     }
 
-    if let Some((fmt, offset)) = scan_embedded_7z_or_rar(file, file_len) {
-        return Some((fmt, offset));
-    }
-
-    None
-}
-
-fn find_embedded_zip_eocd(file: &mut File, file_len: u64) -> Option<u64> {
-    if file_len < 22 {
-        return None;
-    }
-    let tail_len = file_len.min(65_536 + 22) as usize;
-    let tail_start = file_len - tail_len as u64;
+    // Non-split ZIP: verify valid EOCD at the tail of `src`
+    let tail_len = total_len.min(65_536 + 22) as usize;
+    let tail_start = total_len - tail_len as u64;
     let mut tail = vec![0u8; tail_len];
-    file.seek(SeekFrom::Start(tail_start)).ok()?;
-    file.read_exact(&mut tail).ok()?;
+    if src.read_exact_at(tail_start, &mut tail).is_err() {
+        return false;
+    }
 
     let mut i = tail_len.saturating_sub(22);
     loop {
@@ -867,25 +1117,25 @@ fn find_embedded_zip_eocd(file: &mut File, file_len: u64) -> Option<u64> {
                 ]) as u64;
                 let eocd_abs = tail_start + i as u64;
 
-                if let Some(cd_abs) = eocd_abs.checked_sub(cd_size) {
-                    if let Some(zip_start) = cd_abs.checked_sub(cd_offset) {
-                        if zip_start > 0
-                            && verify_bytes_at(file, cd_abs, &[0x50, 0x4B, 0x01, 0x02])
-                            && verify_bytes_at(file, zip_start, &[0x50, 0x4B, 0x03, 0x04])
+                // ZIP64: verify ZIP64 EOCD Locator (`PK\x06\x07`) 20 bytes before EOCD
+                if cd_offset == 0xFFFF_FFFF || cd_size == 0xFFFF_FFFF {
+                    if let Some(loc_pos) = eocd_abs.checked_sub(20) {
+                        let mut sig = [0u8; 4];
+                        if src.read_exact_at(loc_pos, &mut sig).is_ok()
+                            && sig == [0x50, 0x4B, 0x06, 0x07]
                         {
-                            return Some(zip_start);
+                            return true;
                         }
                     }
-                }
-
-                if cd_offset > 0
-                    && cd_offset + cd_size == eocd_abs
-                    && verify_bytes_at(file, cd_offset, &[0x50, 0x4B, 0x01, 0x02])
+                } else if cd_offset
+                    .checked_add(cd_size)
+                    .is_some_and(|end| end <= eocd_abs)
                 {
-                    if let Some(local_off) = read_first_cd_local_offset(file, cd_offset) {
-                        if local_off > 0 && verify_bytes_at(file, local_off, &[0x50, 0x4B, 0x03, 0x04]) {
-                            return Some(local_off);
-                        }
+                    let mut sig = [0u8; 4];
+                    if src.read_exact_at(cd_offset, &mut sig).is_ok()
+                        && sig == [0x50, 0x4B, 0x01, 0x02]
+                    {
+                        return true;
                     }
                 }
             }
@@ -896,159 +1146,62 @@ fn find_embedded_zip_eocd(file: &mut File, file_len: u64) -> Option<u64> {
         i -= 1;
     }
 
-    None
+    false
 }
 
-fn read_first_cd_local_offset(file: &mut File, cd_abs: u64) -> Option<u64> {
-    let mut cd_hdr = [0u8; 46];
-    file.seek(SeekFrom::Start(cd_abs)).ok()?;
-    file.read_exact(&mut cd_hdr).ok()?;
-    if cd_hdr[0..4] != [0x50, 0x4B, 0x01, 0x02] {
-        return None;
-    }
-    let off = u32::from_le_bytes([cd_hdr[42], cd_hdr[43], cd_hdr[44], cd_hdr[45]]) as u64;
-    Some(off)
-}
-
-fn verify_bytes_at(file: &mut File, offset: u64, expected: &[u8]) -> bool {
-    let mut buf = vec![0u8; expected.len()];
-    if file.seek(SeekFrom::Start(offset)).is_err() {
+/// Validates a POSIX 512-byte TAR header checksum.
+pub fn validate_tar_header_checksum(hdr: &[u8]) -> bool {
+    if hdr.len() < 512 {
         return false;
     }
-    if file.read_exact(&mut buf).is_err() {
+    let Ok(chk_str) = std::str::from_utf8(&hdr[148..156]) else {
+        return false;
+    };
+    let trimmed = chk_str.trim_matches(|c: char| c == '\0' || c.is_ascii_whitespace());
+    if trimmed.is_empty() {
         return false;
     }
-    buf == expected
-}
-
-fn scan_embedded_7z_or_rar(file: &mut File, file_len: u64) -> Option<(ArchiveFormat, u64)> {
-    const CHUNK_SIZE: usize = 2 * 1024 * 1024;
-    const OVERLAP: usize = 64;
-    let ranges: Vec<(u64, u64)> = if file_len <= 512 * 1024 * 1024 {
-        vec![(1, file_len)]
-    } else {
-        vec![
-            (1, 64 * 1024 * 1024),
-            (file_len - 128 * 1024 * 1024, file_len),
-        ]
+    let Ok(expected) = u32::from_str_radix(trimmed, 8) else {
+        return false;
     };
 
-    let mut buf = vec![0u8; CHUNK_SIZE + OVERLAP];
-
-    for (range_start, range_end) in ranges {
-        let mut pos = range_start;
-        while pos < range_end {
-            let to_read = ((range_end - pos) as usize).min(CHUNK_SIZE + OVERLAP);
-            if file.seek(SeekFrom::Start(pos)).is_err() {
-                break;
-            }
-            if file.read_exact(&mut buf[..to_read]).is_err() {
-                break;
-            }
-            let slice = &buf[..to_read];
-
-            let mut idx = 0;
-            while idx + 32 <= slice.len() {
-                if slice[idx] == 0x37
-                    && slice[idx + 1] == 0x7A
-                    && slice[idx + 2] == 0xBC
-                    && slice[idx + 3] == 0xAF
-                    && slice[idx + 4] == 0x27
-                    && slice[idx + 5] == 0x1C
-                {
-                    let hdr = &slice[idx..idx + 32];
-                    if validate_7z_start_header(hdr) {
-                        let next_off = u64::from_le_bytes(hdr[12..20].try_into().unwrap());
-                        let next_size = u64::from_le_bytes(hdr[20..28].try_into().unwrap());
-                        let abs_pos = pos + idx as u64;
-                        if abs_pos
-                            .checked_add(32)
-                            .and_then(|v| v.checked_add(next_off))
-                            .and_then(|v| v.checked_add(next_size))
-                            .is_some_and(|end| end <= file_len)
-                        {
-                            return Some((ArchiveFormat::SevenZ, abs_pos));
-                        }
-                    }
-                }
-
-                if slice[idx] == 0x52
-                    && slice[idx + 1] == 0x61
-                    && slice[idx + 2] == 0x72
-                    && slice[idx + 3] == 0x21
-                    && slice[idx + 4] == 0x1A
-                    && slice[idx + 5] == 0x07
-                {
-                    let abs_pos = pos + idx as u64;
-                    if slice[idx + 6] == 0x01 && slice[idx + 7] == 0x00 {
-                        if validate_rar5_header(file, abs_pos, file_len) {
-                            return Some((ArchiveFormat::Rar, abs_pos));
-                        }
-                    } else if slice[idx + 6] == 0x00 {
-                        if idx + 14 <= slice.len() && slice[idx + 9] == 0x73 {
-                            return Some((ArchiveFormat::Rar, abs_pos));
-                        }
-                    }
-                }
-
-                idx += 1;
-            }
-
-            if to_read <= OVERLAP {
-                break;
-            }
-            pos += (to_read - OVERLAP) as u64;
-        }
+    let mut unsigned_sum: u32 = 0;
+    let mut signed_sum: i32 = 0;
+    for (idx, &b) in hdr[0..512].iter().enumerate() {
+        let byte = if (148..156).contains(&idx) { b' ' } else { b };
+        unsigned_sum += byte as u32;
+        signed_sum += (byte as i8) as i32;
     }
-
-    None
+    expected == unsigned_sum || (signed_sum >= 0 && expected == signed_sum as u32)
 }
 
-fn validate_rar5_header(file: &mut File, abs_pos: u64, file_len: u64) -> bool {
-    if abs_pos + 16 > file_len {
-        return false;
-    }
-    let mut head = [0u8; 64];
-    let avail = (file_len - (abs_pos + 8)).min(64) as usize;
-    if file.seek(SeekFrom::Start(abs_pos + 8)).is_err() {
-        return false;
-    }
-    if file.read_exact(&mut head[..avail]).is_err() {
-        return false;
-    }
-    let expected_crc = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
-
-    let mut header_size: u64 = 0;
-    let mut shift = 0;
-    let mut vint_len = 0;
-    for &b in &head[4..avail] {
-        vint_len += 1;
-        header_size |= ((b & 0x7F) as u64) << shift;
-        if (b & 0x80) == 0 {
-            break;
-        }
-        shift += 7;
-        if shift > 28 {
-            return false;
+/// Distinguishes genuine Office/EPUB ZIP-based documents from a plain ZIP renamed to `.docx`.
+pub fn is_real_zip_document_source(header: &[u8], src: &mut dyn ByteSource, ext: &str) -> bool {
+    let mut probe_buf = header.to_vec();
+    let total_len = src.len();
+    if total_len > 4096 {
+        let tail_size = total_len.min(65536) as usize;
+        let mut tail = vec![0u8; tail_size];
+        if src.read_exact_at(total_len - tail_size as u64, &mut tail).is_ok() {
+            probe_buf.extend_from_slice(&tail);
         }
     }
 
-    if header_size == 0 || header_size > 4096 {
-        return false;
-    }
-    let total_crc_data = vint_len + header_size as usize;
-    if abs_pos + 8 + 4 + total_crc_data as u64 > file_len {
-        return false;
-    }
+    let contains_marker = |marker: &[u8]| {
+        probe_buf
+            .windows(marker.len())
+            .any(|w| w.eq_ignore_ascii_case(marker))
+    };
 
-    let mut crc_buf = vec![0u8; total_crc_data];
-    if file.seek(SeekFrom::Start(abs_pos + 12)).is_err() {
-        return false;
-    }
-    if file.read_exact(&mut crc_buf).is_err() {
-        return false;
-    }
-    crc32fast::hash(&crc_buf) == expected_crc
+    let has_office_marker = contains_marker(b"[Content_Types].xml")
+        && (contains_marker(b"word/")
+            || contains_marker(b"xl/")
+            || contains_marker(b"ppt/")
+            || contains_marker(b"_rels/.rels"));
+    let has_epub_marker = contains_marker(b"application/epub+zip")
+        || (contains_marker(b"META-INF/container.xml") && ext == "epub");
+
+    has_office_marker || has_epub_marker
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -1135,12 +1288,59 @@ pub fn extract_password_hints_from_text(text: &str) -> Vec<String> {
     hints
 }
 
-/// Extract potential password hints embedded in a filename (e.g. `资源_密码123456.zip`, `test[解压码abc].7z`).
+/// If `name` has one or more trailing non-archive disguise extensions wrapping a known archive
+/// extension (e.g. `secret.zip.mp4`, `secret.zip.mp4.jpg`, `backup.tar.gz.mp4.exe`),
+/// returns the inner archive filename (`secret.zip`, `backup.tar.gz`).
+pub fn strip_outer_disguise_exts(name: &str) -> String {
+    if let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str()) {
+        if ArchiveFormat::from_extension(&ext.to_ascii_lowercase()).is_some() {
+            return name.to_string();
+        }
+    }
+    let mut cur = name;
+    for _ in 0..16 {
+        let Some(stem) = Path::new(cur).file_stem().and_then(|s| s.to_str()) else {
+            break;
+        };
+        if stem == cur {
+            break;
+        }
+        if let Some(ext) = Path::new(stem).extension().and_then(|e| e.to_str()) {
+            if ArchiveFormat::from_extension(&ext.to_ascii_lowercase()).is_some() {
+                return stem.to_string();
+            }
+        }
+        cur = stem;
+    }
+    name.to_string()
+}
+
+/// Extract potential password hints embedded in a filename (e.g. `资源_密码123456.zip`, `test[解压码abc].7z`, `资料_密码123.zip.mp4.jpg`).
 pub fn extract_password_hints_from_filename(path: &Path) -> Vec<String> {
-    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+    let Some(raw_name) = path.file_name().and_then(|n| n.to_str()) else {
         return Vec::new();
     };
-    extract_password_hints_from_text(stem)
+    let mut hints = Vec::new();
+    // For multi-extension disguised files like `资料_密码123456.zip.mp4.jpg`, prioritize the clean inner stem
+    // so `123456` is tried before `123456.zip`.
+    let stripped = strip_outer_disguise_exts(raw_name);
+    if stripped != raw_name {
+        if let Some(inner_stem) = Path::new(&stripped).file_stem().and_then(|s| s.to_str()) {
+            for h in extract_password_hints_from_text(inner_stem) {
+                if !hints.contains(&h) {
+                    hints.push(h);
+                }
+            }
+        }
+    }
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+        for h in extract_password_hints_from_text(stem) {
+            if !hints.contains(&h) {
+                hints.push(h);
+            }
+        }
+    }
+    hints
 }
 
 /// Scan small sibling `.txt`/`.nfo`/`.md` files in the archive's directory for password hints
@@ -1202,7 +1402,6 @@ pub fn extract_password_hints_from_sibling_txt(archive_path: &Path) -> Vec<Strin
                     hints.push(h);
                 }
             }
-            // If the file is literally a tiny 1-line password file (e.g. `密码.txt` containing just `abc123`)
             let trimmed = text.trim();
             if !trimmed.is_empty()
                 && !trimmed.contains('\n')
@@ -1324,6 +1523,13 @@ mod tests {
 
         let hints2 = extract_password_hints_from_filename(Path::new("pack[pw=abc123].zip"));
         assert!(hints2.contains(&"abc123".to_string()));
+
+        // Double/multi-extension Apate filenames should extract clean password without `.zip`
+        let hints3 = extract_password_hints_from_filename(Path::new("资料_密码123456.zip.mp4"));
+        assert_eq!(hints3.first().map(String::as_str), Some("123456"));
+
+        let hints4 = extract_password_hints_from_filename(Path::new("资料_密码654321.7z.mp4.jpg"));
+        assert_eq!(hints4.first().map(String::as_str), Some("654321"));
     }
 
     #[test]
@@ -1355,7 +1561,7 @@ mod tests {
         }
         let det = detect_file(&fake_mp4, DetectOptions::default()).unwrap();
         assert_eq!(det.format, ArchiveFormat::SevenZ);
-        assert_eq!(det.offset, 0);
+        assert!(!det.is_stego_carrier());
         assert!(matches!(
             det.trick,
             TrickKind::DisguisedExtension { ref original_ext } if original_ext == "mp4"
@@ -1373,8 +1579,12 @@ mod tests {
         }
         let det2 = detect_file(&poly_jpg, DetectOptions::default()).unwrap();
         assert_eq!(det2.format, ArchiveFormat::Zip);
-        assert_eq!(det2.offset, 12);
-        assert!(matches!(det2.trick, TrickKind::Polyglot { offset: 12, .. }));
+        assert!(det2.is_stego_carrier());
+        assert_eq!(det2.stego_tool(), Some("polyglot"));
+        assert!(matches!(
+            det2.trick,
+            TrickKind::Stego { tool: "polyglot", ref badge } if badge.contains("JPEG图种") && badge.contains("12 B")
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

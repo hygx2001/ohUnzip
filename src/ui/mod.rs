@@ -1028,11 +1028,22 @@ impl OhUnzipApp {
                     .items_center()
                     .gap_2p5()
                     .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .text_color(theme.foreground)
-                            .child("OhUnzip"),
+                        h_flex()
+                            .items_baseline()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .text_color(theme.foreground)
+                                    .child("OhUnzip"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(concat!("v", env!("CARGO_PKG_VERSION"))),
+                            ),
                     )
                     .child(sz_status)
                     .into_any_element()

@@ -7,6 +7,7 @@ mod extractor;
 mod notify;
 mod seven_zip;
 mod single_instance;
+mod stego;
 mod theme;
 mod trash;
 mod ui;
@@ -81,7 +82,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(400.), px(280.))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("OhUnzip".into()),
+                    title: Some(concat!("OhUnzip v", env!("CARGO_PKG_VERSION")).into()),
                     ..Default::default()
                 }),
                 ..Default::default()
