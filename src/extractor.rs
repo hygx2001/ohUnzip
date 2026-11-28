@@ -3,10 +3,11 @@ use crate::detector::{
     self, ArchiveFormat, DetectOptions, DetectedArchive, DisguisedSplitInfo, TrickKind,
     extract_password_hints_from_filename,
 };
+use crate::lz4::{self, Lz4Error};
 use crate::seven_zip::new_hidden_command;
 use crate::stego::{StegoError, StegoRestorer};
 use crate::trash;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -295,17 +296,52 @@ impl ExtractionContext {
                 (path, detected.format.seven_zip_type())
             }
         } else if let Some(ref split_info) = detected.disguised_split {
-            let (guard, first_clean, linked_count) =
-                stage_disguised_split_volumes(archive_path, split_info)
-                    .map_err(ExtractError::Fatal)?;
-            self.log(format!(
-                "[第{}层] 已硬链接还原 {} 个改后缀分卷 → {}",
-                depth + 1,
-                linked_count,
-                split_info.clean_filename()
-            ));
+            let (guard, first_clean, total_count, unwrapped_count) =
+                self.stage_disguised_split_volumes(archive_path, split_info, depth)?;
+            if unwrapped_count > 0 {
+                self.log(format!(
+                    "[第{}层] 已准备 {} 个分卷（解包 {} 个外层压缩分卷）→ {}",
+                    depth + 1,
+                    total_count,
+                    unwrapped_count,
+                    split_info.clean_filename()
+                ));
+            } else {
+                self.log(format!(
+                    "[第{}层] 已硬链接还原 {} 个改后缀分卷 → {}",
+                    depth + 1,
+                    total_count,
+                    split_info.clean_filename()
+                ));
+            }
             _split_guard = Some(guard);
             (first_clean, None)
+        } else if detected.is_split {
+            // Plain first split volume (e.g. `sample.part1.rar`) whose sibling parts may still be
+            // wrapped/disguised (e.g. `sample.part2.rar.bz2` / `.lz4` / `.mp4`)
+            let plain_split_info = archive_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(detector::parse_any_split_filename);
+            if let Some(ref info) = plain_split_info {
+                if has_wrapped_or_disguised_siblings(archive_path, info) {
+                    let (guard, first_clean, total_count, unwrapped_count) =
+                        self.stage_disguised_split_volumes(archive_path, info, depth)?;
+                    self.log(format!(
+                        "[第{}层] 检测到混合外层分卷，已准备 {} 个分卷（解包 {} 个外层）→ {}",
+                        depth + 1,
+                        total_count,
+                        unwrapped_count,
+                        info.clean_filename()
+                    ));
+                    _split_guard = Some(guard);
+                    (first_clean, None)
+                } else {
+                    (archive_path.to_path_buf(), None)
+                }
+            } else {
+                (archive_path.to_path_buf(), None)
+            }
         } else {
             let ftype = match detected.trick {
                 TrickKind::DisguisedExtension { .. } if !detected.is_split => {
@@ -316,16 +352,23 @@ impl ExtractionContext {
             (archive_path.to_path_buf(), ftype)
         };
 
-        let candidates = self.build_password_candidates(archive_path);
         let staging_dir = make_staging_dir(target_dir).map_err(ExtractError::Fatal)?;
-        let extract_result = self.extract_with_passwords(
-            &actual_archive,
-            archive_path,
-            force_type,
-            &staging_dir,
-            &candidates,
-            depth,
-        );
+        let extract_result = if detected.format == ArchiveFormat::Lz4
+            && !detected.is_split
+            && detected.disguised_split.is_none()
+        {
+            self.extract_standalone_lz4(&actual_archive, archive_path, &staging_dir, depth)
+        } else {
+            let candidates = self.build_password_candidates(archive_path);
+            self.extract_with_passwords(
+                &actual_archive,
+                archive_path,
+                force_type,
+                &staging_dir,
+                &candidates,
+                depth,
+            )
+        };
 
         match extract_result {
             Ok(used_password) => {
@@ -560,7 +603,11 @@ impl ExtractionContext {
                 match self.run_7z_extract(actual_archive, force_type, staging_dir, "") {
                     Ok(()) => return Ok(String::new()),
                     Err(SevenZRunError::Cancelled) => return Err(ExtractError::Cancelled),
-                    Err(_) => {
+                    Err(SevenZRunError::Other(msg)) => {
+                        clear_dir_contents(staging_dir);
+                        return Err(ExtractError::Fatal(msg));
+                    }
+                    Err(SevenZRunError::WrongPassword) => {
                         clear_dir_contents(staging_dir);
                     }
                 }
@@ -584,12 +631,26 @@ impl ExtractionContext {
                         idx + 1,
                         candidates.len()
                     ));
-                    if self.test_7z_list_password(actual_archive, force_type, pw) {
-                        self.stage(format!("[第{}层] 密码匹配，正在解压...", depth + 1));
-                        match self.run_7z_extract(actual_archive, force_type, staging_dir, pw) {
-                            Ok(()) => return Ok(pw.clone()),
-                            Err(SevenZRunError::Cancelled) => return Err(ExtractError::Cancelled),
-                            Err(_) => clear_dir_contents(staging_dir),
+                    match self.test_7z_list_password(actual_archive, force_type, pw) {
+                        PasswordTestResult::Matched => {
+                            self.stage(format!("[第{}层] 密码匹配，正在解压...", depth + 1));
+                            match self.run_7z_extract(actual_archive, force_type, staging_dir, pw) {
+                                Ok(()) => return Ok(pw.clone()),
+                                Err(SevenZRunError::Cancelled) => {
+                                    return Err(ExtractError::Cancelled);
+                                }
+                                Err(SevenZRunError::WrongPassword) => {
+                                    clear_dir_contents(staging_dir);
+                                }
+                                Err(SevenZRunError::Other(msg)) => {
+                                    clear_dir_contents(staging_dir);
+                                    return Err(ExtractError::Fatal(msg));
+                                }
+                            }
+                        }
+                        PasswordTestResult::WrongPassword => continue,
+                        PasswordTestResult::FatalError(msg) => {
+                            return Err(ExtractError::Fatal(msg));
                         }
                     }
                 }
@@ -621,8 +682,12 @@ impl ExtractionContext {
                         candidates.len()
                     ));
                     if let Some(ref entry) = smallest_entry {
-                        if !self.test_7z_entry_password(actual_archive, force_type, pw, entry) {
-                            continue;
+                        match self.test_7z_entry_password(actual_archive, force_type, pw, entry) {
+                            PasswordTestResult::Matched => {}
+                            PasswordTestResult::WrongPassword => continue,
+                            PasswordTestResult::FatalError(msg) => {
+                                return Err(ExtractError::Fatal(msg));
+                            }
                         }
                     }
                     self.stage(format!("[第{}层] 密码匹配，正在解压...", depth + 1));
@@ -645,6 +710,9 @@ impl ExtractionContext {
                         candidates.len()
                     ),
                 });
+            }
+            EncryptionProbe::Fatal(msg) => {
+                return Err(ExtractError::Fatal(msg));
             }
             EncryptionProbe::Unknown => {}
         }
@@ -805,11 +873,18 @@ impl ExtractionContext {
 
         let comment_hints = extract_comment_hints_from_slt(&combined);
 
+        if let Some(fatal) = classify_7z_missing_volume(&combined) {
+            return (EncryptionProbe::Fatal(fatal), comment_hints);
+        }
+
         if is_wrong_password_output(&combined) {
             return (EncryptionProbe::HeaderEncrypted, comment_hints);
         }
 
         if !out.status.success() {
+            if let Some(fatal) = classify_7z_non_password_fatal(&combined) {
+                return (EncryptionProbe::Fatal(fatal), comment_hints);
+            }
             return (EncryptionProbe::Unknown, comment_hints);
         }
 
@@ -894,7 +969,12 @@ impl ExtractionContext {
         }
     }
 
-    fn test_7z_list_password(&self, archive: &Path, force_type: Option<&str>, pw: &str) -> bool {
+    fn test_7z_list_password(
+        &self,
+        archive: &Path,
+        force_type: Option<&str>,
+        pw: &str,
+    ) -> PasswordTestResult {
         let mut cmd = new_hidden_command(&self.seven_zip);
         cmd.arg("l").arg("-y").arg("-sccUTF-8");
         add_password_arg(&mut cmd, pw);
@@ -902,7 +982,27 @@ impl ExtractionContext {
             cmd.arg(format!("-t{t}"));
         }
         cmd.arg("--").arg(archive);
-        cmd.output().is_ok_and(|o| o.status.success())
+        let Ok(out) = cmd.output() else {
+            return PasswordTestResult::FatalError("无法启动 7z 进程".into());
+        };
+        if out.status.success() {
+            return PasswordTestResult::Matched;
+        }
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if let Some(fatal) = classify_7z_missing_volume(&combined) {
+            return PasswordTestResult::FatalError(fatal);
+        }
+        if is_wrong_password_output(&combined) {
+            return PasswordTestResult::WrongPassword;
+        }
+        if let Some(fatal) = classify_7z_non_password_fatal(&combined) {
+            return PasswordTestResult::FatalError(fatal);
+        }
+        PasswordTestResult::FatalError(extract_7z_error_line(&combined))
     }
 
     fn test_7z_entry_password(
@@ -911,7 +1011,7 @@ impl ExtractionContext {
         force_type: Option<&str>,
         pw: &str,
         entry: &str,
-    ) -> bool {
+    ) -> PasswordTestResult {
         let mut cmd = new_hidden_command(&self.seven_zip);
         cmd.arg("t").arg("-y").arg("-sccUTF-8");
         add_password_arg(&mut cmd, pw);
@@ -919,7 +1019,27 @@ impl ExtractionContext {
             cmd.arg(format!("-t{t}"));
         }
         cmd.arg("--").arg(archive).arg(entry);
-        cmd.output().is_ok_and(|o| o.status.success())
+        let Ok(out) = cmd.output() else {
+            return PasswordTestResult::FatalError("无法启动 7z 进程".into());
+        };
+        if out.status.success() {
+            return PasswordTestResult::Matched;
+        }
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if let Some(fatal) = classify_7z_missing_volume(&combined) {
+            return PasswordTestResult::FatalError(fatal);
+        }
+        if is_wrong_password_output(&combined) {
+            return PasswordTestResult::WrongPassword;
+        }
+        if let Some(fatal) = classify_7z_non_password_fatal(&combined) {
+            return PasswordTestResult::FatalError(fatal);
+        }
+        PasswordTestResult::WrongPassword
     }
 
     /// Streams `7z x -bsp1` so we report real-time progress percentages and support instant cancellation.
@@ -1031,25 +1151,231 @@ impl ExtractionContext {
             String::from_utf8_lossy(&stderr_bytes)
         );
 
+        if let Some(fatal) = classify_7z_missing_volume(&combined) {
+            return Err(SevenZRunError::Other(fatal));
+        }
+
         if is_wrong_password_output(&combined) {
             return Err(SevenZRunError::WrongPassword);
         }
 
-        let err_line = combined
-            .lines()
-            .map(str::trim)
-            .filter(|l| {
-                let low = l.to_ascii_lowercase();
-                low.contains("error")
-                    || low.contains("cannot open")
-                    || low.contains("can not open")
-                    || low.contains("unsupported")
-            })
-            .last()
-            .or_else(|| combined.lines().map(str::trim).filter(|l| !l.is_empty()).last())
-            .unwrap_or("7z 解压返回错误");
+        if let Some(fatal) = classify_7z_non_password_fatal(&combined) {
+            return Err(SevenZRunError::Other(fatal));
+        }
 
-        Err(SevenZRunError::Other(err_line.to_string()))
+        Err(SevenZRunError::Other(extract_7z_error_line(&combined)))
+    }
+
+    /// Decompresses a standalone LZ4 Frame file natively in pure Rust into `staging_dir`.
+    fn extract_standalone_lz4(
+        &self,
+        actual_archive: &Path,
+        original_archive: &Path,
+        staging_dir: &Path,
+        depth: usize,
+    ) -> Result<String, ExtractError> {
+        self.stage(format!("[第{}层] 正在解压 LZ4...", depth + 1));
+        let orig_name = original_archive
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("output.lz4");
+        let lower = orig_name.to_ascii_lowercase();
+        let inner_name = if lower.ends_with(".lz4") && orig_name.len() > 4 {
+            orig_name[..orig_name.len() - 4].to_string()
+        } else {
+            format!("{orig_name}.out")
+        };
+        let dst = staging_dir.join(inner_name);
+        let max_bytes = self.config.max_total_extract_mb.saturating_mul(1024 * 1024);
+        let budget = max_bytes.saturating_sub(self.total_extracted_bytes);
+        lz4::decompress_file(actual_archive, &dst, budget, &self.cancel_flag)
+            .map_err(map_lz4_error)?;
+        Ok(String::new())
+    }
+
+    /// Prepares all sibling split volumes (supporting mixed outer compression wrappers like
+    /// `.part1.rar.lz4` + `.part2.rar.bz2`, plain + wrapped combinations, and renamed splits)
+    /// into a temporary directory with clean volume names and validates headers before passing to 7z.
+    fn stage_disguised_split_volumes(
+        &self,
+        first_vol: &Path,
+        info: &DisguisedSplitInfo,
+        depth: usize,
+    ) -> Result<(TempDirGuard, PathBuf, usize, usize), ExtractError> {
+        let parent = first_vol.parent().unwrap_or_else(|| Path::new("."));
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let stage_dir = parent.join(format!(".ohunzip_split_{}_{}", std::process::id(), ts));
+        fs::create_dir_all(&stage_dir)
+            .map_err(|e| ExtractError::Fatal(format!("无法创建分卷还原临时目录: {e}")))?;
+        let guard = TempDirGuard(stage_dir.clone());
+
+        let siblings = find_disguised_split_siblings_detailed(first_vol, info);
+        if let Some(missing_name) = find_missing_split_gap(&siblings, info) {
+            return Err(ExtractError::Fatal(format!(
+                "分卷不完整，缺少分卷文件: {missing_name}"
+            )));
+        }
+
+        let inner_fmt = detector::infer_split_format_from_name(Path::new(&info.clean_filename()));
+        let first_clean_path = stage_dir.join(info.clean_filename());
+        let total = siblings.len();
+        let mut unwrapped_count = 0usize;
+
+        for (idx, sib) in siblings.into_iter().enumerate() {
+            if self.is_cancelled() {
+                return Err(ExtractError::Cancelled);
+            }
+            let dst = stage_dir.join(&sib.clean_name);
+            let did_unwrap = self.prepare_single_split_volume(
+                &sib.src_path,
+                &dst,
+                &stage_dir,
+                inner_fmt,
+                depth,
+                idx + 1,
+                total,
+            )?;
+            if did_unwrap {
+                unwrapped_count += 1;
+            }
+            validate_staged_split_volume(&sib.src_path, &dst, sib.part_num, inner_fmt)?;
+        }
+
+        if !first_clean_path.exists() {
+            return Err(ExtractError::Fatal("未能还原首卷分卷文件".into()));
+        }
+
+        Ok((guard, first_clean_path, total, unwrapped_count))
+    }
+
+    /// Unwraps 0..4 outer compression layers (LZ4, BZip2, GZip, XZ, Zstd, or outer ZIP/7z/TAR)
+    /// around a single split volume into `dst`. Returns `true` if at least one outer layer was unpacked.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_single_split_volume(
+        &self,
+        src_path: &Path,
+        dst: &Path,
+        stage_dir: &Path,
+        inner_fmt: ArchiveFormat,
+        depth: usize,
+        vol_idx: usize,
+        vol_total: usize,
+    ) -> Result<bool, ExtractError> {
+        const MAX_OUTER_LAYERS: usize = 4;
+        let mut cur_src = src_path.to_path_buf();
+        let mut temp_guards: Vec<TempFileGuard> = Vec::new();
+        let mut unwrapped_layers = 0usize;
+
+        for layer in 0..MAX_OUTER_LAYERS {
+            if self.is_cancelled() {
+                return Err(ExtractError::Cancelled);
+            }
+            let Some(outer_fmt) = detect_outer_wrapper_format(&cur_src, inner_fmt) else {
+                break;
+            };
+
+            self.stage(format!(
+                "[第{}层] 正在解包外层 {} 分卷 ({}/{})...",
+                depth + 1,
+                outer_fmt.display_name(),
+                vol_idx,
+                vol_total
+            ));
+
+            let layer_out = stage_dir.join(format!(
+                ".unwrap_v{vol_idx}_l{layer}_{}.bin",
+                std::process::id()
+            ));
+            let layer_guard = TempFileGuard(layer_out.clone());
+
+            match outer_fmt {
+                ArchiveFormat::Lz4 => {
+                    let max_bytes = self.config.max_total_extract_mb.saturating_mul(1024 * 1024);
+                    let budget = max_bytes.saturating_sub(self.total_extracted_bytes);
+                    lz4::decompress_file(&cur_src, &layer_out, budget, &self.cancel_flag)
+                        .map_err(map_lz4_error)?;
+                }
+                _ => {
+                    self.decompress_outer_volume_with_7z(
+                        &cur_src,
+                        outer_fmt,
+                        &layer_out,
+                        stage_dir,
+                    )?;
+                }
+            }
+
+            cur_src = layer_out;
+            temp_guards.push(layer_guard);
+            unwrapped_layers += 1;
+        }
+
+        if unwrapped_layers > 0 {
+            if fs::rename(&cur_src, dst).is_err() {
+                fs::copy(&cur_src, dst)
+                    .map_err(|e| ExtractError::Fatal(format!("无法移动解包后的分卷文件: {e}")))?;
+            }
+            return Ok(true);
+        }
+
+        if fs::hard_link(src_path, dst).is_err() {
+            fs::copy(src_path, dst)
+                .map_err(|e| ExtractError::Fatal(format!("无法准备分卷文件: {e}")))?;
+        }
+        Ok(false)
+    }
+
+    fn decompress_outer_volume_with_7z(
+        &self,
+        src: &Path,
+        outer_fmt: ArchiveFormat,
+        dst_file: &Path,
+        stage_dir: &Path,
+    ) -> Result<(), ExtractError> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_dir = stage_dir.join(format!(".unwrap_7z_{ts}"));
+        fs::create_dir_all(&tmp_dir)
+            .map_err(|e| ExtractError::Fatal(format!("无法创建外层解包临时目录: {e}")))?;
+        let _dir_guard = TempDirGuard(tmp_dir.clone());
+
+        match self.run_7z_extract(src, outer_fmt.seven_zip_type(), &tmp_dir, "") {
+            Ok(()) => {}
+            Err(SevenZRunError::Cancelled) => return Err(ExtractError::Cancelled),
+            Err(SevenZRunError::WrongPassword) => {
+                return Err(ExtractError::Fatal(format!(
+                    "分卷外层压缩包需要密码（{}），请先单独解开外层",
+                    src.file_name().and_then(|n| n.to_str()).unwrap_or("")
+                )));
+            }
+            Err(SevenZRunError::Other(msg)) => {
+                return Err(ExtractError::Fatal(format!(
+                    "解包分卷外层 {} 失败（{}）: {msg}",
+                    outer_fmt.display_name(),
+                    src.file_name().and_then(|n| n.to_str()).unwrap_or("")
+                )));
+            }
+        }
+
+        let extracted = collect_files_recursively(&tmp_dir);
+        if extracted.len() != 1 {
+            return Err(ExtractError::Fatal(format!(
+                "分卷外层 {} 解包后包含 {} 个文件（预期 1 个分卷文件）",
+                outer_fmt.display_name(),
+                extracted.len()
+            )));
+        }
+
+        if fs::rename(&extracted[0], dst_file).is_err() {
+            fs::copy(&extracted[0], dst_file)
+                .map_err(|e| ExtractError::Fatal(format!("无法整理外层解包结果: {e}")))?;
+        }
+        Ok(())
     }
 
     /// Restores a single stego/polyglot file to a temporary file without modifying the original.
@@ -1187,11 +1513,25 @@ fn map_stego_error(err: StegoError) -> ExtractError {
     }
 }
 
+fn map_lz4_error(err: Lz4Error) -> ExtractError {
+    match err {
+        Lz4Error::Cancelled => ExtractError::Cancelled,
+        Lz4Error::Message(msg) => ExtractError::Fatal(msg),
+    }
+}
+
 enum EncryptionProbe {
     Unencrypted,
     HeaderEncrypted,
     DataEncrypted { smallest_entry: Option<String> },
+    Fatal(String),
     Unknown,
+}
+
+enum PasswordTestResult {
+    Matched,
+    WrongPassword,
+    FatalError(String),
 }
 
 enum SevenZRunError {
@@ -1267,76 +1607,252 @@ fn is_wrong_password_output(text: &str) -> bool {
         || lower.contains("headers error") && lower.contains("encrypted")
 }
 
-/// Hard-links all sibling disguised split volumes (e.g. `movie.7z.001.mp4`, `.002.mp4`...)
-/// into a hidden temp directory in the same parent folder with restored clean names
-/// (`movie.7z.001`, `movie.7z.002`...) at zero extra disk space.
-fn stage_disguised_split_volumes(
+/// Detects explicit missing-volume errors from 7-Zip output so they are NEVER misreported as wrong passwords.
+fn classify_7z_missing_volume(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let low = trimmed.to_ascii_lowercase();
+        if let Some(pos) = low.find("missing volume") {
+            let after = trimmed[pos + "missing volume".len()..]
+                .trim_start_matches([':', ' ', '\t']);
+            if !after.is_empty() {
+                return Some(format!("缺少分卷文件: {after}"));
+            }
+            return Some("分卷不完整，缺少后续分卷文件".into());
+        }
+    }
+    None
+}
+
+/// Classifies non-password fatal 7-Zip errors into clear user-facing diagnostics.
+fn classify_7z_non_password_fatal(text: &str) -> Option<String> {
+    if let Some(m) = classify_7z_missing_volume(text) {
+        return Some(m);
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("unsupported method") {
+        return Some("压缩包使用了当前 7-Zip 不支持的压缩算法".into());
+    }
+    if lower.contains("unexpected end of data") || lower.contains("unexpected end of archive") {
+        return Some("压缩包或分卷数据不完整（可能缺少后续分卷或外层未解开）".into());
+    }
+    if (lower.contains("cannot open the file as archive")
+        || lower.contains("can not open the file as archive")
+        || lower.contains("is not archive"))
+        && !is_wrong_password_output(text)
+    {
+        return Some("无法作为有效压缩包打开（文件可能损坏或外层格式不受支持）".into());
+    }
+    None
+}
+
+fn extract_7z_error_line(combined: &str) -> String {
+    combined
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            let low = l.to_ascii_lowercase();
+            low.contains("error")
+                || low.contains("cannot open")
+                || low.contains("can not open")
+                || low.contains("unsupported")
+                || low.contains("missing volume")
+        })
+        .last()
+        .or_else(|| combined.lines().map(str::trim).filter(|l| !l.is_empty()).last())
+        .unwrap_or("7z 解压返回错误")
+        .to_string()
+}
+
+/// Checks whether `path` starts with an outer compression wrapper that should be unpacked
+/// before treating the file as a raw split volume of `inner_fmt`.
+fn detect_outer_wrapper_format(path: &Path, inner_fmt: ArchiveFormat) -> Option<ArchiveFormat> {
+    let magic_fmt = detector::detect_magic_at_start_of_file(path)?;
+    // Single-stream compressors (LZ4/BZip2/GZip/XZ/Zstd) are always outer wrappers around split volumes
+    if matches!(
+        magic_fmt,
+        ArchiveFormat::Lz4
+            | ArchiveFormat::Bzip2
+            | ArchiveFormat::Gzip
+            | ArchiveFormat::Xz
+            | ArchiveFormat::Zstd
+    ) {
+        return Some(magic_fmt);
+    }
+    // Container archive wrapping a different split archive (e.g. `sample.part1.rar.zip` or `.7z`)
+    if inner_fmt != ArchiveFormat::Generic && magic_fmt != inner_fmt {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if magic_fmt.known_extensions().contains(&ext.as_str()) {
+            return Some(magic_fmt);
+        }
+    }
+    None
+}
+
+/// Validates that a staged split volume has a valid header for `inner_fmt` so unsupported outer
+/// wrappers (e.g. `.lzo`, `.br`) produce an explicit error instead of misleading password errors.
+fn validate_staged_split_volume(
+    orig_src: &Path,
+    staged_path: &Path,
+    part_num: u32,
+    inner_fmt: ArchiveFormat,
+) -> Result<(), ExtractError> {
+    let should_check = match inner_fmt {
+        // Every RAR4/RAR5 split volume starts with `Rar!\x1A\x07`
+        ArchiveFormat::Rar => true,
+        // 7z and ZIP raw byte splits only carry the archive magic on volume 1
+        ArchiveFormat::SevenZ | ArchiveFormat::Zip => part_num == 1,
+        _ => false,
+    };
+    if !should_check {
+        return Ok(());
+    }
+
+    let actual_fmt = detector::detect_magic_at_start_of_file(staged_path);
+    if actual_fmt == Some(inner_fmt) {
+        return Ok(());
+    }
+
+    let orig_name = orig_src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("分卷文件");
+    let ext = orig_src
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    if !ext.is_empty() && !inner_fmt.known_extensions().contains(&ext.to_ascii_lowercase().as_str())
+    {
+        Err(ExtractError::Fatal(format!(
+            "分卷外层格式不受支持或文件已损坏：{orig_name}（外层 .{ext} 无法还原为有效的 {} 分卷）",
+            inner_fmt.display_name()
+        )))
+    } else {
+        Err(ExtractError::Fatal(format!(
+            "分卷文件头无效或已损坏：{orig_name}（不是有效的 {} 分卷）",
+            inner_fmt.display_name()
+        )))
+    }
+}
+
+struct SplitSibling {
+    part_num: u32,
+    src_path: PathBuf,
+    clean_name: String,
+    disguise_tail: String,
+}
+
+fn find_missing_split_gap(siblings: &[SplitSibling], info: &DisguisedSplitInfo) -> Option<String> {
+    let max_part = siblings.iter().map(|s| s.part_num).max().unwrap_or(1);
+    let present: HashSet<u32> = siblings.iter().map(|s| s.part_num).collect();
+    let width = info.number_str.len();
+    for expected in 1..=max_part {
+        if !present.contains(&expected) {
+            let num_fmt = if width > 1 {
+                format!("{expected:0width$}")
+            } else {
+                format!("{expected}")
+            };
+            return Some(format!("{}{}{}", info.prefix, num_fmt, info.mid_suffix));
+        }
+    }
+    None
+}
+
+fn has_wrapped_or_disguised_siblings(first_vol: &Path, info: &DisguisedSplitInfo) -> bool {
+    let siblings = find_disguised_split_siblings_detailed(first_vol, info);
+    siblings.iter().any(|s| !s.disguise_tail.is_empty())
+}
+
+/// Finds all sibling split volumes matching `(prefix, mid_suffix)` regardless of outer wrapper
+/// suffix (supporting mixed wrappers like `.part1.rar.lz4` + `.part2.rar.bz2` + `.part3.rar`).
+fn find_disguised_split_siblings_detailed(
     first_vol: &Path,
     info: &DisguisedSplitInfo,
-) -> Result<(TempDirGuard, PathBuf, usize), String> {
-    let parent = first_vol.parent().unwrap_or_else(|| Path::new("."));
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let stage_dir = parent.join(format!(".ohunzip_split_{ts}"));
-    fs::create_dir_all(&stage_dir).map_err(|e| format!("无法创建分卷还原临时目录: {e}"))?;
+) -> Vec<SplitSibling> {
+    let mut by_part: BTreeMap<u32, SplitSibling> = BTreeMap::new();
+    by_part.insert(
+        info.part_num,
+        SplitSibling {
+            part_num: info.part_num,
+            src_path: first_vol.to_path_buf(),
+            clean_name: info.clean_filename(),
+            disguise_tail: info.disguise_tail.clone(),
+        },
+    );
 
-    let siblings = find_disguised_split_siblings(first_vol, info);
-    let mut linked = 0usize;
-    let first_clean_path = stage_dir.join(info.clean_filename());
+    let Some(parent) = first_vol.parent() else {
+        return by_part.into_values().collect();
+    };
+    let prefix_low = info.prefix.to_ascii_lowercase();
+    let mid_low = info.mid_suffix.to_ascii_lowercase();
+    let tail_low = info.disguise_tail.to_ascii_lowercase();
 
-    for (src_path, clean_name) in siblings {
-        let dst = stage_dir.join(&clean_name);
-        if fs::hard_link(&src_path, &dst).is_err() {
-            fs::copy(&src_path, &dst).map_err(|e| format!("无法准备分卷文件 {clean_name}: {e}"))?;
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_file() || p == first_vol {
+                continue;
+            }
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(cand) = detector::parse_any_split_filename(name) else {
+                continue;
+            };
+            if cand.prefix.to_ascii_lowercase() != prefix_low
+                || cand.mid_suffix.to_ascii_lowercase() != mid_low
+            {
+                continue;
+            }
+            if cand.part_num == info.part_num {
+                continue;
+            }
+
+            let cand_tail_low = cand.disguise_tail.to_ascii_lowercase();
+            let candidate = SplitSibling {
+                part_num: cand.part_num,
+                src_path: p,
+                clean_name: cand.clean_filename(),
+                disguise_tail: cand.disguise_tail,
+            };
+
+            match by_part.get(&cand.part_num) {
+                None => {
+                    by_part.insert(cand.part_num, candidate);
+                }
+                Some(existing) => {
+                    // Prefer an exact same outer tail (when non-empty), otherwise prefer plain unwrapped volume
+                    let existing_tail_low = existing.disguise_tail.to_ascii_lowercase();
+                    let prefer_new = (!tail_low.is_empty()
+                        && cand_tail_low == tail_low
+                        && existing_tail_low != tail_low)
+                        || (existing_tail_low != tail_low
+                            && cand_tail_low.is_empty()
+                            && !existing_tail_low.is_empty());
+                    if prefer_new {
+                        by_part.insert(cand.part_num, candidate);
+                    }
+                }
+            }
         }
-        linked += 1;
     }
 
-    if !first_clean_path.exists() {
-        let _ = fs::remove_dir_all(&stage_dir);
-        return Err("未能还原首卷分卷文件".into());
-    }
-
-    Ok((TempDirGuard(stage_dir), first_clean_path, linked))
+    by_part.into_values().collect()
 }
 
 fn find_disguised_split_siblings(
     first_vol: &Path,
     info: &DisguisedSplitInfo,
 ) -> Vec<(PathBuf, String)> {
-    let Some(parent) = first_vol.parent() else {
-        return vec![(first_vol.to_path_buf(), info.clean_filename())];
-    };
-    let prefix_low = info.prefix.to_ascii_lowercase();
-    let mid_low = info.mid_suffix.to_ascii_lowercase();
-    let tail_low = info.disguise_tail.to_ascii_lowercase();
-
-    let mut out = Vec::new();
-    if let Ok(entries) = fs::read_dir(parent) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if !p.is_file() {
-                continue;
-            }
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if let Some(cand) = detector::parse_disguised_split_filename(name) {
-                    if cand.prefix.to_ascii_lowercase() == prefix_low
-                        && cand.mid_suffix.to_ascii_lowercase() == mid_low
-                        && cand.disguise_tail.to_ascii_lowercase() == tail_low
-                    {
-                        out.push((p, cand.clean_filename()));
-                    }
-                }
-            }
-        }
-    }
-    if out.is_empty() {
-        out.push((first_vol.to_path_buf(), info.clean_filename()));
-    }
-    out.sort_by(|a, b| a.1.cmp(&b.1));
-    out
+    find_disguised_split_siblings_detailed(first_vol, info)
+        .into_iter()
+        .map(|s| (s.src_path, s.clean_name))
+        .collect()
 }
 
 /// Finds all sibling split volumes along with their restored clean filenames (works for both
@@ -1380,7 +1896,14 @@ pub fn clean_archive_stem(path: &Path) -> String {
     let lower = name.to_ascii_lowercase();
 
     for compound in [
-        ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".7z.001", ".zip.001", ".rar.001",
+        ".tar.gz",
+        ".tar.bz2",
+        ".tar.xz",
+        ".tar.zst",
+        ".tar.lz4",
+        ".7z.001",
+        ".zip.001",
+        ".rar.001",
     ] {
         if lower.ends_with(compound) {
             let stem = &name[..name.len() - compound.len()];
@@ -1868,6 +2391,173 @@ mod tests {
         }
         let split2_out = split2_out_dir.expect("2-layer stacked Apate split 7z should succeed");
         assert_eq!(fs::read(split2_out.join("data.bin")).unwrap(), big_bytes);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_mixed_outer_wrapped_encrypted_splits_and_clear_errors() {
+        let Some(sz) = crate::seven_zip::detect_seven_zip("") else {
+            return;
+        };
+
+        let dir = std::env::temp_dir().join("oh_unzip_mixed_split_tests");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // 1. Standalone LZ4 file extraction
+        let lz4_payload = b"Standalone LZ4 content verified!\n".repeat(120);
+        let standalone_lz4 = dir.join("note.txt.lz4");
+        fs::write(
+            &standalone_lz4,
+            crate::lz4::tests::encode_lz4_frame_uncompressed(&lz4_payload),
+        )
+        .unwrap();
+        let (tx_lz, rx_lz) = mpsc::channel();
+        run_extraction_job(
+            standalone_lz4,
+            sz.path.clone(),
+            AppConfig::default(),
+            None,
+            OutputTarget::SameDir,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            tx_lz,
+        );
+        let mut lz_out_dir = None;
+        while let Ok(ev) = rx_lz.try_recv() {
+            if let ExtractEvent::Completed { output_dir, .. } = ev {
+                lz_out_dir = Some(output_dir);
+            }
+        }
+        let lz_out = lz_out_dir.expect("standalone .lz4 extraction should succeed");
+        assert_eq!(fs::read(lz_out.join("note.txt")).unwrap(), lz4_payload);
+
+        // 2. Header-encrypted 3-volume 7z where vol1=.lz4, vol2=.bz2, vol3=plain!
+        let mix_dir = dir.join("mixed");
+        fs::create_dir_all(&mix_dir).unwrap();
+        let secret_file = mix_dir.join("secret.bin");
+        let secret_bytes: Vec<u8> = (0..10_000).map(|i| ((i * 41 + 9) & 0xFF) as u8).collect();
+        fs::write(&secret_file, &secret_bytes).unwrap();
+
+        let base_7z = mix_dir.join("pack.7z");
+        let st = new_hidden_command(&sz.path)
+            .args(["a", "-t7z", "-mx=0", "-mhe=on", "-pMixPass123", "-v4k", "-y"])
+            .arg(&base_7z)
+            .arg(&secret_file)
+            .status()
+            .unwrap();
+        assert!(st.success());
+
+        // Wrap vol 1 in LZ4, vol 2 in BZip2, keep vol 3 plain
+        let v1_raw = fs::read(mix_dir.join("pack.7z.001")).unwrap();
+        let v1_lz4 = mix_dir.join("pack.7z.001.lz4");
+        fs::write(&v1_lz4, crate::lz4::tests::encode_lz4_frame_uncompressed(&v1_raw)).unwrap();
+        fs::remove_file(mix_dir.join("pack.7z.001")).unwrap();
+
+        let v2_plain = mix_dir.join("pack.7z.002");
+        let v2_bz2 = mix_dir.join("pack.7z.002.bz2");
+        let st_bz = new_hidden_command(&sz.path)
+            .args(["a", "-tbzip2", "-y"])
+            .arg(&v2_bz2)
+            .arg(&v2_plain)
+            .status()
+            .unwrap();
+        assert!(st_bz.success());
+        fs::remove_file(&v2_plain).unwrap();
+
+        // 2a. Wrong password must ask for password
+        let (tx_w, rx_w) = mpsc::channel();
+        run_extraction_job(
+            v1_lz4.clone(),
+            sz.path.clone(),
+            AppConfig::default(),
+            Some("WrongPass".into()),
+            OutputTarget::SameDir,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            tx_w,
+        );
+        let mut saw_need_pw = false;
+        while let Ok(ev) = rx_w.try_recv() {
+            if matches!(ev, ExtractEvent::NeedPassword { .. }) {
+                saw_need_pw = true;
+            }
+        }
+        assert!(saw_need_pw, "wrong password on wrapped header-encrypted split must return NeedPassword");
+
+        // 2b. Correct password must unwrap vol1 (.lz4) + vol2 (.bz2) + join plain vol3 and extract!
+        let (tx_ok, rx_ok) = mpsc::channel();
+        run_extraction_job(
+            v1_lz4.clone(),
+            sz.path.clone(),
+            AppConfig::default(),
+            Some("MixPass123".into()),
+            OutputTarget::SameDir,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            tx_ok,
+        );
+        let mut ok_out_dir = None;
+        let mut fail_msg = None;
+        while let Ok(ev) = rx_ok.try_recv() {
+            match ev {
+                ExtractEvent::Completed { output_dir, .. } => ok_out_dir = Some(output_dir),
+                ExtractEvent::Failed(m) => fail_msg = Some(m),
+                _ => {}
+            }
+        }
+        let ok_out = ok_out_dir.unwrap_or_else(|| {
+            panic!("mixed LZ4+BZ2+plain encrypted split should succeed, failed: {fail_msg:?}")
+        });
+        assert_eq!(fs::read(ok_out.join("secret.bin")).unwrap(), secret_bytes);
+
+        // 3. Missing volume gap (remove vol2.bz2 while vol3 still exists) => MUST fail explicitly, NOT NeedPassword!
+        fs::remove_file(&v2_bz2).unwrap();
+        let (tx_gap, rx_gap) = mpsc::channel();
+        run_extraction_job(
+            v1_lz4,
+            sz.path.clone(),
+            AppConfig::default(),
+            Some("MixPass123".into()),
+            OutputTarget::SameDir,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            tx_gap,
+        );
+        let mut gap_err = None;
+        while let Ok(ev) = rx_gap.try_recv() {
+            if let ExtractEvent::Failed(m) = ev {
+                gap_err = Some(m);
+            }
+        }
+        let gap_msg = gap_err.expect("missing volume gap must fail with explicit Fatal error");
+        assert!(gap_msg.contains("缺少分卷"), "unexpected error: {gap_msg}");
+
+        // 4. Unsupported outer format (`bad.part1.rar.lzo` with garbage bytes) => MUST fail explicitly, NOT NeedPassword!
+        let bad_dir = dir.join("unsupported");
+        fs::create_dir_all(&bad_dir).unwrap();
+        let bad_vol = bad_dir.join("bad.part1.rar.lzo");
+        fs::write(&bad_vol, b"\x89LZO\x00\x0d\x0a\x1a\x0anot-a-rar-volume-at-all").unwrap();
+        let (tx_bad, rx_bad) = mpsc::channel();
+        run_extraction_job(
+            bad_vol,
+            sz.path.clone(),
+            AppConfig::default(),
+            Some("any".into()),
+            OutputTarget::SameDir,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            tx_bad,
+        );
+        let mut bad_err = None;
+        while let Ok(ev) = rx_bad.try_recv() {
+            if let ExtractEvent::Failed(m) = ev {
+                bad_err = Some(m);
+            }
+        }
+        let bad_msg = bad_err.expect("unsupported outer wrapper must return explicit Fatal error");
+        assert!(bad_msg.contains("不受支持"), "unexpected error: {bad_msg}");
 
         let _ = fs::remove_dir_all(&dir);
     }

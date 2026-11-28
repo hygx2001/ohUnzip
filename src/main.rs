@@ -4,6 +4,7 @@ mod config;
 mod context_menu;
 mod detector;
 mod extractor;
+mod lz4;
 mod notify;
 mod seven_zip;
 mod single_instance;

@@ -14,6 +14,7 @@ pub enum ArchiveFormat {
     Bzip2,
     Xz,
     Zstd,
+    Lz4,
     Lzma,
     Tar,
     Cab,
@@ -39,6 +40,7 @@ impl ArchiveFormat {
             Self::Bzip2 => "BZIP2",
             Self::Xz => "XZ",
             Self::Zstd => "ZSTD",
+            Self::Lz4 => "LZ4",
             Self::Lzma => "LZMA",
             Self::Tar => "TAR",
             Self::Cab => "CAB",
@@ -64,6 +66,7 @@ impl ArchiveFormat {
             Self::Bzip2 => "bz2",
             Self::Xz => "xz",
             Self::Zstd => "zst",
+            Self::Lz4 => "lz4",
             Self::Lzma => "lzma",
             Self::Tar => "tar",
             Self::Cab => "cab",
@@ -89,6 +92,7 @@ impl ArchiveFormat {
             Self::Bzip2 => Some("bzip2"),
             Self::Xz => Some("xz"),
             Self::Zstd => Some("zstd"),
+            Self::Lz4 => None,
             Self::Lzma => Some("lzma"),
             Self::Tar => Some("tar"),
             Self::Cab => Some("cab"),
@@ -114,6 +118,7 @@ impl ArchiveFormat {
             Self::Bzip2 => &["bz2", "tbz2", "tbz", "bzip2"],
             Self::Xz => &["xz", "txz"],
             Self::Zstd => &["zst", "tzst", "zstd"],
+            Self::Lz4 => &["lz4"],
             Self::Lzma => &["lzma"],
             Self::Tar => &["tar"],
             Self::Cab => &["cab"],
@@ -143,6 +148,7 @@ impl ArchiveFormat {
                 | Self::Bzip2
                 | Self::Xz
                 | Self::Zstd
+                | Self::Lz4
                 | Self::Tar
         )
     }
@@ -156,6 +162,7 @@ impl ArchiveFormat {
             "bz2" | "tbz2" | "tbz" | "bzip2" => Some(Self::Bzip2),
             "xz" | "txz" => Some(Self::Xz),
             "zst" | "tzst" | "zstd" => Some(Self::Zstd),
+            "lz4" => Some(Self::Lz4),
             "lzma" => Some(Self::Lzma),
             "tar" => Some(Self::Tar),
             "cab" => Some(Self::Cab),
@@ -181,6 +188,7 @@ impl ArchiveFormat {
             "bzip2" => Some(Self::Bzip2),
             "xz" => Some(Self::Xz),
             "zstd" => Some(Self::Zstd),
+            "lz4" => Some(Self::Lz4),
             "lzma" => Some(Self::Lzma),
             "tar" => Some(Self::Tar),
             "cab" => Some(Self::Cab),
@@ -443,7 +451,55 @@ pub fn parse_disguised_split_filename(name: &str) -> Option<DisguisedSplitInfo> 
     None
 }
 
-/// Returns true if the file is a secondary split archive part that must NOT be extracted independently.
+/// Parses EITHER a disguised/wrapped split volume (e.g. `sample.part1.rar.lz4`, `movie.7z.002.bz2`)
+/// OR a plain split volume (e.g. `sample.part1.rar`, `movie.7z.002`, with empty `disguise_tail`).
+pub fn parse_any_split_filename(name: &str) -> Option<DisguisedSplitInfo> {
+    if let Some(info) = parse_disguised_split_filename(name) {
+        return Some(info);
+    }
+
+    let lower = name.to_ascii_lowercase();
+
+    // Plain `*.part<digits>.rar`
+    if let Some(before_rar) = lower.strip_suffix(".rar") {
+        if let Some(part_pos) = before_rar.rfind(".part") {
+            let num_str = &name[part_pos + 5..name.len() - 4];
+            if !num_str.is_empty() && num_str.bytes().all(|b| b.is_ascii_digit()) {
+                if let Ok(part_num) = num_str.parse::<u32>() {
+                    if part_num >= 1 {
+                        return Some(DisguisedSplitInfo {
+                            prefix: name[..part_pos + 5].to_string(),
+                            number_str: num_str.to_string(),
+                            part_num,
+                            mid_suffix: name[name.len() - 4..].to_string(),
+                            disguise_tail: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Plain `*.<3 digits>` (e.g. `movie.7z.001`, `archive.002`)
+    if let Some(dot_pos) = name.rfind('.') {
+        let num_str = &name[dot_pos + 1..];
+        if num_str.len() == 3 && num_str.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(part_num) = num_str.parse::<u32>() {
+                if (1..=999).contains(&part_num) {
+                    return Some(DisguisedSplitInfo {
+                        prefix: name[..dot_pos + 1].to_string(),
+                        number_str: num_str.to_string(),
+                        part_num,
+                        mid_suffix: String::new(),
+                        disguise_tail: String::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    None
+}
 pub fn is_non_first_split_volume(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -519,7 +575,7 @@ pub fn split_first_volume_label(path: &Path) -> Option<String> {
     None
 }
 
-fn infer_split_format_from_name(path: &Path) -> ArchiveFormat {
+pub fn infer_split_format_from_name(path: &Path) -> ArchiveFormat {
     let lower = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -622,6 +678,24 @@ pub fn detect_file_with_context(
         }
 
         if let Some(info) = disguised_split_first {
+            let inner_fmt = infer_split_format_from_name(Path::new(&info.clean_filename()));
+            let is_outer_wrapper =
+                is_expected_ext || (inner_fmt != ArchiveFormat::Generic && fmt != inner_fmt);
+            if is_outer_wrapper {
+                let effective_fmt = if inner_fmt != ArchiveFormat::Generic {
+                    inner_fmt
+                } else {
+                    fmt
+                };
+                let label = format!("外层{}分卷 {}", fmt.display_name(), info.clean_filename());
+                return Some(DetectedArchive {
+                    format: effective_fmt,
+                    trick: TrickKind::SplitVolume { label },
+                    is_split: true,
+                    disguised_split: Some(info),
+                    stego: None,
+                });
+            }
             if opts.detect_disguised {
                 let label = format!("改后缀分卷 {}", info.clean_filename());
                 return Some(DetectedArchive {
@@ -742,6 +816,24 @@ pub fn detect_file_with_context(
     None
 }
 
+/// Detects the archive format strictly from magic bytes at offset 0 of `path`.
+pub fn detect_magic_at_start_of_file(path: &Path) -> Option<ArchiveFormat> {
+    let mut file = File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if file_len < 6 {
+        return None;
+    }
+    let header_len = file_len.min(4096) as usize;
+    let mut header = vec![0u8; header_len];
+    file.read_exact(&mut header).ok()?;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    detect_magic_at_start(&header, &mut file, file_len, &ext)
+}
+
 fn detect_magic_at_start(
     header: &[u8],
     file: &mut File,
@@ -800,6 +892,11 @@ fn detect_magic_at_start(
     // ZSTD: 28 B5 2F FD
     if header[0..4] == [0x28, 0xB5, 0x2F, 0xFD] {
         return Some(ArchiveFormat::Zstd);
+    }
+
+    // LZ4 Frame: 04 22 4D 18 + validated header checksum
+    if crate::lz4::is_valid_lz4_frame_header(header) {
+        return Some(ArchiveFormat::Lz4);
     }
 
     // CAB: MSCF + reserved zeros (only matched when extension is .cab)
@@ -946,6 +1043,11 @@ fn detect_strict_format_from_source(
         && (header[4] & 0x08) == 0
     {
         return Some(ArchiveFormat::Zstd);
+    }
+
+    // LZ4 Frame: 04 22 4D 18 + validated FLG/BD/xxHash32 header checksum
+    if crate::lz4::is_valid_lz4_frame_header(header) {
+        return Some(ArchiveFormat::Lz4);
     }
 
     // TAR: "ustar" at offset 257 + valid 512-byte header checksum
